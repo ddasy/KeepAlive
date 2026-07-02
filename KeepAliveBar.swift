@@ -110,7 +110,10 @@ final class Store: ObservableObject {
         }
         try? FileManager.default.createDirectory(atPath: workdir, withIntermediateDirectories: true)
         launchAtLogin = (SMAppService.mainApp.status == .enabled)
-        Task { await refresh() }   // 启动时取一次时间
+        Task {   // 开机/程序启动后先等 5 分钟，再做首次拉取（避免开机瞬间抢跑）
+            try? await Task.sleep(nanoseconds: 300_000_000_000)
+            await refresh()
+        }
         // 本地倒计时 + 到点判断；不再定时轮询接口（resets_at 在一个 5h 窗口内固定不变）
         tickTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
