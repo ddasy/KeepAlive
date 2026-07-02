@@ -283,7 +283,7 @@ struct ContentView: View {
         if !s.autoEnabled { return "自动保活已关闭" }
         guard let r = s.fiveReset else { return "下次保活：等待用量数据…" }
         let rem = r.timeIntervalSince(s.now)
-        return rem > 0 ? "下次保活：约 \(Store.hhmm(rem)) 后（窗口重置时）" : "下次保活：即将执行"
+        return rem > 0 ? "下次保活：约 \(Store.hhmm(rem)) 后" : "下次保活：即将执行"
     }
 
     var body: some View {
