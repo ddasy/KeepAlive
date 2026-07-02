@@ -1,0 +1,10 @@
+# 构建产物（可用 build-app.sh 重新生成）
+KeepAliveBar.app/
+
+# 运行时目录/文件
+null/
+*.log
+state.json
+
+# macOS
+.DS_Store
