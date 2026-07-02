@@ -301,12 +301,19 @@ struct ContentView: View {
 
             Divider()
             Text(nextFireText).font(.caption).foregroundStyle(.secondary)
-            Toggle("自动保活", isOn: $s.autoEnabled)
-                .toggleStyle(.switch).font(.caption)
-            Toggle("开机自启", isOn: Binding(
-                get: { s.launchAtLogin },
-                set: { s.setLaunchAtLogin($0) }
-            )).toggleStyle(.switch).font(.caption)
+            HStack {
+                Text("自动保活").font(.caption)
+                Spacer()
+                Toggle("", isOn: $s.autoEnabled).toggleStyle(.switch).labelsHidden()
+            }
+            HStack {
+                Text("开机自启").font(.caption)
+                Spacer()
+                Toggle("", isOn: Binding(
+                    get: { s.launchAtLogin },
+                    set: { s.setLaunchAtLogin($0) }
+                )).toggleStyle(.switch).labelsHidden()
+            }
 
             HStack(spacing: 8) {
                 Button(s.paused ? "恢复" : "暂停") { s.togglePause() }
