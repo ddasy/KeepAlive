@@ -62,6 +62,9 @@ final class Store: ObservableObject {
         didSet { UserDefaults.standard.set(autoEnabled, forKey: "autoEnabled") }
     }
     @Published var launchAtLogin: Bool = false
+    @Published var paused: Bool {                                 // 暂停：停止 GET 与续窗
+        didSet { UserDefaults.standard.set(paused, forKey: "paused") }
+    }
 
     let bufferSec: TimeInterval = 90        // 真实重置时刻之后再等这么久才发（确保旧窗口确已关闭）
     let retryIntervalSec: TimeInterval = 180 // 两次“尝试”最小间隔：失败/未续窗时按此退避重试（3 分钟）
@@ -69,8 +72,8 @@ final class Store: ObservableObject {
     let keychainService = "Claude Code-credentials"
     let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
 
-    private var pollTimer: Timer?
     private var tickTimer: Timer?
+    private var acting = false   // 正在处理“窗口关闭”（联网确认+续窗），防重入
 
     var home: String { NSHomeDirectory() }
     var supportDir: String { "\(NSHomeDirectory())/Library/Application Support/KeepAliveBar" }
@@ -78,15 +81,14 @@ final class Store: ObservableObject {
 
     init() {
         self.autoEnabled = (UserDefaults.standard.object(forKey: "autoEnabled") as? Bool) ?? true
+        self.paused = UserDefaults.standard.bool(forKey: "paused")   // 默认 false
         if let t = UserDefaults.standard.object(forKey: "lastFire") as? Double {
             self.lastFire = Date(timeIntervalSince1970: t)
         }
         try? FileManager.default.createDirectory(atPath: workdir, withIntermediateDirectories: true)
         launchAtLogin = (SMAppService.mainApp.status == .enabled)
-        Task { await refresh() }
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            Task { await self?.refresh() }
-        }
+        Task { await refresh() }   // 启动时取一次时间
+        // 本地倒计时 + 到点判断；不再定时轮询接口（resets_at 在一个 5h 窗口内固定不变）
         tickTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
         }
@@ -94,6 +96,7 @@ final class Store: ObservableObject {
 
     // 菜单栏标题：仅显示距 5h 窗口重置的剩余时间（图标已是 Clawd，去掉闪电标识）
     var menuTitle: String {
+        if paused { return "⏸" }
         guard let r = fiveReset else { return "–" }
         let rem = r.timeIntervalSince(now)
         return rem <= 0 ? "now" : Store.hhmm(rem)
@@ -104,9 +107,19 @@ final class Store: ObservableObject {
         return h > 0 ? "\(h)h\(String(format: "%02d", m))m" : "\(m)m"
     }
 
+    // 剩余时间：空格分隔，只从最高非零单位起显示（如 30m / 1h 35m / 1d 5h 55m）
+    nonisolated static func dhm(_ s: TimeInterval) -> String {
+        let t = Int(max(0, s))
+        let d = t / 86400, h = (t % 86400) / 3600, m = (t % 3600) / 60
+        if d > 0 { return "\(d)d \(h)h \(m)m" }
+        if h > 0 { return "\(h)h \(m)m" }
+        return "\(m)m"
+    }
+
     func tick() {
-        now = Date()
-        evaluateFire()
+        guard !paused else { return }   // 暂停：不倒计时、不联网、不续窗
+        now = Date()   // 本地倒计时（不联网）
+        maybeAct()     // 只有到点了才会去联网确认并续窗
     }
 
     func baseEnv() -> [String: String] {
@@ -128,6 +141,7 @@ final class Store: ObservableObject {
     }
 
     func refresh() async {
+        guard !paused else { return }   // 暂停时不执行 GET
         guard let tok = await token() else {
             lastError = "无法读取 Keychain token（API-key 用户？或未授权 security 访问）"
             return
@@ -150,25 +164,34 @@ final class Store: ObservableObject {
             sonnetPct = u.seven_day_sonnet?.utilization; sonnetReset = parseISO(u.seven_day_sonnet?.resets_at)
             lastError = nil
             now = Date()
-            evaluateFire()
         } catch {
             lastError = "查询失败: \(error.localizedDescription)"
         }
     }
 
-    // 决策：自动开启 & 窗口已关（越过真实重置时刻）& 未违反防抖 → 发保活
-    func evaluateFire() {
-        guard autoEnabled, !busyFiring else { return }
+    // 纯本地判断：本地倒计时是否已过重置时刻。到点才触发一次“联网确认 + 续窗”，平时不联网
+    func maybeAct() {
+        guard autoEnabled, !busyFiring, !acting else { return }
         let now = Date()
-        // 距上次“尝试”不足 retryIntervalSec 则不动：
-        //  · 正常续窗成功后 → resets_at 前移约 5h，下面的窗口判据自然关闸
-        //  · 若发了却没成功续窗（失败 / 落进仍有剩余时间的旧窗口）→ resets_at 仍在过去，据此退避重试
+        // 距上次“尝试”不足 retryIntervalSec 则不动（失败/未续窗时按此退避重试）
         if let la = lastAttempt, now.timeIntervalSince(la) < retryIntervalSec { return }
-        guard let r = fiveReset else { return } // 无用量数据不乱发
-        // 只有当“真实重置时刻已过”（窗口确已关闭、无剩余时间）才发；窗口还有剩余时间则继续等待
-        if now.timeIntervalSince(r) >= bufferSec {
-            Task { await fire() }
+        guard let r = fiveReset else { return }   // 还没拿到时间
+        if now.timeIntervalSince(r) >= bufferSec { // 本地倒计时已归零 → 该续窗了
+            Task { await handleWindowClosed() }
         }
+    }
+
+    // 到点了：先联网**确认**权威 resets_at（防本地缓存过期 / 用户已自行开新窗），仍关闭才发保活
+    func handleWindowClosed() async {
+        guard !acting, !busyFiring else { return }
+        acting = true
+        defer { acting = false }
+        await refresh()                               // 只有到点时才联网取最新 resets_at
+        guard let r = fiveReset else { return }
+        if Date().timeIntervalSince(r) >= bufferSec {  // 确认确已关闭、无剩余时间 → 续窗
+            await fire()
+        }
+        // 否则：窗口其实还有剩余时间（用户已开新窗 / 时钟偏差）→ 不发，回到本地倒计时
     }
 
     func fire() async {
@@ -199,6 +222,12 @@ final class Store: ObservableObject {
     }
 
     func refreshNow() { Task { await refresh() } }
+
+    // 暂停 / 恢复：暂停后停止 GET 与续窗；恢复后立即刷新一次
+    func togglePause() {
+        paused.toggle()
+        if !paused { refreshNow() }
+    }
 
     // 开机自启：注册/注销登录项；首次开启时跳转「系统设置▸登录项」让用户确认
     func setLaunchAtLogin(_ on: Bool) {
@@ -239,8 +268,8 @@ func localMDHM(_ d: Date) -> String { let f = DateFormatter(); f.dateFormat = "M
 func resetInfo(_ reset: Date?, _ now: Date) -> String {
     guard let r = reset else { return "重置 —" }
     let rem = r.timeIntervalSince(now)
-    return rem >= 0 ? "重置 \(localHM(r))（还剩 \(Store.hhmm(rem))）"
-                    : "重置 \(localHM(r))（已过 \(Store.hhmm(-rem))）"
+    return rem >= 0 ? "重置 \(localHM(r))（剩余时间 \(Store.dhm(rem))）"
+                    : "重置 \(localHM(r))（已过 \(Store.dhm(-rem))）"
 }
 
 // MARK: - 弹窗界面
@@ -250,6 +279,7 @@ struct ContentView: View {
     var maxPct: Double { max(s.fivePct ?? 0, s.sevenPct ?? 0) }
 
     var nextFireText: String {
+        if s.paused { return "已暂停（点“恢复”继续监控与续窗）" }
         if !s.autoEnabled { return "自动保活已关闭" }
         guard let r = s.fiveReset else { return "下次保活：等待用量数据…" }
         let rem = r.timeIntervalSince(s.now)
@@ -261,28 +291,29 @@ struct ContentView: View {
             HStack {
                 Text("Claude 保活").font(.headline)
                 Spacer()
-                Circle().fill(sevColor(maxPct)).frame(width: 9, height: 9)
+                Circle().fill(s.paused ? .gray : sevColor(maxPct)).frame(width: 9, height: 9)
             }
 
             usageRow("5 小时会话", s.fivePct, s.fiveReset)
-            usageRow("周 · 全模型", s.sevenPct, s.sevenReset)
+            usageRow("周限", s.sevenPct, s.sevenReset)
             if s.opusPct != nil { usageRow("周 · Opus", s.opusPct, s.opusReset) }
             if s.sonnetPct != nil { usageRow("周 · Sonnet", s.sonnetPct, s.sonnetReset) }
 
             Divider()
             Text(nextFireText).font(.caption).foregroundStyle(.secondary)
-            Toggle("自动保活（窗口一关就续下一个 5h）", isOn: $s.autoEnabled)
+            Toggle("自动保活", isOn: $s.autoEnabled)
                 .toggleStyle(.switch).font(.caption)
-            Toggle("开机自启（登录时自动启动）", isOn: Binding(
+            Toggle("开机自启", isOn: Binding(
                 get: { s.launchAtLogin },
                 set: { s.setLaunchAtLogin($0) }
             )).toggleStyle(.switch).font(.caption)
 
             HStack(spacing: 8) {
+                Button(s.paused ? "恢复" : "暂停") { s.togglePause() }
+                Button("刷新") { s.refreshNow() }.disabled(s.paused)
                 if s.busyFiring {
                     Text("保活中…").font(.caption2).foregroundStyle(.secondary)
                 }
-                Button("刷新") { s.refreshNow() }
                 Spacer()
                 Button("退出") { NSApp.terminate(nil) }
             }
@@ -299,6 +330,7 @@ struct ContentView: View {
         }
         .padding(14)
         .frame(width: 300)
+        .onAppear { s.refreshNow() }   // 打开弹窗时刷新一次用量（保证看到的是最新的）
     }
 
     @ViewBuilder
