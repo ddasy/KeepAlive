@@ -164,8 +164,8 @@ final class Store: ObservableObject {
     }
 
     func refresh() async {
-        guard !paused else { return }   // 暂停时不执行 GET
-        await readCodexUsage()          // Codex 用量：本地读日志，与 Claude 独立
+        await readCodexUsage()          // Codex：本地读文件，不联网/不耗额度 → 不受暂停影响
+        guard !paused else { return }   // 暂停：仅停止 Claude 的 GET 与续窗（不影响上面的 Codex）
         guard let tok = await token() else {
             lastError = "无法读取 Keychain token（API-key 用户？或未授权 security 访问）"
             return
