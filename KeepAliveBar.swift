@@ -16,6 +16,21 @@ struct UsageResponse: Decodable {
     let seven_day_sonnet: Bucket?
 }
 
+// Codex 用量（来自 ~/.codex 会话日志里最后一条 rate_limits 快照，本地读取，无需联网）
+struct CodexRollout: Decodable {
+    struct Payload: Decodable {
+        struct RL: Decodable {
+            struct Bucket: Decodable { let used_percent: Double?; let resets_at: Double? }
+            let primary: Bucket?      // 5 小时
+            let secondary: Bucket?    // 周
+            let plan_type: String?
+        }
+        let rate_limits: RL?
+    }
+    let timestamp: String?
+    let payload: Payload?
+}
+
 func parseISO(_ s: String?) -> Date? {
     guard let s = s else { return nil }
     // 去掉微秒小数部分（ISO8601DateFormatter 对 6 位小数会失败）
@@ -53,6 +68,14 @@ final class Store: ObservableObject {
     @Published var opusReset: Date?
     @Published var sonnetPct: Double?
     @Published var sonnetReset: Date?
+    // Codex 用量（本地日志快照）
+    @Published var codexAvailable = false
+    @Published var codexPlan: String?
+    @Published var codexPrimaryUsed: Double?
+    @Published var codexPrimaryReset: Date?
+    @Published var codexWeeklyUsed: Double?
+    @Published var codexWeeklyReset: Date?
+    @Published var codexSnapshotAt: Date?
     @Published var lastError: String?
     @Published var lastFire: Date?
     @Published var lastFireResult: String = ""
@@ -142,6 +165,7 @@ final class Store: ObservableObject {
 
     func refresh() async {
         guard !paused else { return }   // 暂停时不执行 GET
+        await readCodexUsage()          // Codex 用量：本地读日志，与 Claude 独立
         guard let tok = await token() else {
             lastError = "无法读取 Keychain token（API-key 用户？或未授权 security 访问）"
             return
@@ -167,6 +191,28 @@ final class Store: ObservableObject {
         } catch {
             lastError = "查询失败: \(error.localizedDescription)"
         }
+    }
+
+    // 读取 Codex 最新用量快照（~/.codex 会话日志里最后一条 rate_limits）——本地读取，不联网、不耗额度
+    func readCodexUsage() async {
+        let env = baseEnv()
+        let cmd = "for f in $(ls -t \"$HOME\"/.codex/sessions/*/*/*/rollout-*.jsonl 2>/dev/null | head -12); do " +
+                  "line=$(grep -a rate_limits \"$f\" 2>/dev/null | tail -1); " +
+                  "[ -n \"$line\" ] && { printf '%s' \"$line\"; break; }; done"
+        let r = await Task.detached { Shell.run("/bin/bash", ["-c", cmd], env: env) }.value
+        guard let data = r.out.data(using: .utf8), !data.isEmpty,
+              let roll = try? JSONDecoder().decode(CodexRollout.self, from: data),
+              let rl = roll.payload?.rate_limits else {
+            codexAvailable = false
+            return
+        }
+        codexAvailable = true
+        codexPlan = rl.plan_type
+        codexPrimaryUsed = rl.primary?.used_percent
+        codexPrimaryReset = rl.primary?.resets_at.map { Date(timeIntervalSince1970: $0) }
+        codexWeeklyUsed = rl.secondary?.used_percent
+        codexWeeklyReset = rl.secondary?.resets_at.map { Date(timeIntervalSince1970: $0) }
+        codexSnapshotAt = parseISO(roll.timestamp)
     }
 
     // 纯本地判断：本地倒计时是否已过重置时刻。到点才触发一次“联网确认 + 续窗”，平时不联网
@@ -265,6 +311,7 @@ func sevColor(_ pct: Double?) -> Color {
 }
 func localHM(_ d: Date) -> String { let f = DateFormatter(); f.dateFormat = "HH:mm"; return f.string(from: d) }
 func localMDHM(_ d: Date) -> String { let f = DateFormatter(); f.dateFormat = "MM-dd HH:mm"; return f.string(from: d) }
+func localMonthDayHM(_ d: Date) -> String { let f = DateFormatter(); f.dateFormat = "M月d日 HH:mm"; return f.string(from: d) }
 func resetInfo(_ reset: Date?, _ now: Date) -> String {
     guard let r = reset else { return "重置 —" }
     let rem = r.timeIntervalSince(now)
@@ -289,7 +336,7 @@ struct ContentView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("Claude 保活").font(.headline)
+                Text("Claude").font(.headline)
                 Spacer()
                 Circle().fill(s.paused ? .gray : sevColor(maxPct)).frame(width: 9, height: 9)
             }
@@ -298,6 +345,19 @@ struct ContentView: View {
             usageRow("周限", s.sevenPct, s.sevenReset)
             if s.opusPct != nil { usageRow("周 · Opus", s.opusPct, s.opusReset) }
             if s.sonnetPct != nil { usageRow("周 · Sonnet", s.sonnetPct, s.sonnetReset) }
+
+            if s.codexAvailable {
+                Divider()
+                HStack {
+                    Text("Codex").font(.headline)
+                    Spacer()
+                    if let p = s.codexPlan {
+                        Text(p).font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+                codexRow("5 小时", s.codexPrimaryUsed, s.codexPrimaryReset, withDate: false)
+                codexRow("周限", s.codexWeeklyUsed, s.codexWeeklyReset, withDate: true)
+            }
 
             Divider()
             Text(nextFireText).font(.caption).foregroundStyle(.secondary)
@@ -351,6 +411,28 @@ struct ContentView: View {
             }
             ProgressView(value: min(max((pct ?? 0) / 100, 0), 1)).tint(sevColor(pct))
             Text(resetInfo(reset, s.now)).font(.caption2).foregroundStyle(.secondary)
+        }
+    }
+
+    // Codex 行：剩余百分比 + 重置时间（withDate=true 时带日期，如 7月8日 04:59）
+    @ViewBuilder
+    func codexRow(_ title: String, _ used: Double?, _ reset: Date?, withDate: Bool) -> some View {
+        let rolledOff = reset.map { $0 <= s.now } ?? false
+        let usedNow = rolledOff ? 0 : (used ?? 0)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(title).font(.subheadline).bold()
+                Spacer()
+                Text(used == nil ? "—" : "剩余 \(Int((100 - usedNow).rounded()))%")
+                    .font(.subheadline).foregroundStyle(sevColor(usedNow))
+            }
+            ProgressView(value: min(max(usedNow / 100, 0), 1)).tint(sevColor(usedNow))
+            if rolledOff {
+                Text("已重置（快照过期，无实时数据）").font(.caption2).foregroundStyle(.secondary)
+            } else if let r = reset {
+                Text(withDate ? "重置时间 \(localMonthDayHM(r))" : "重置 \(localHM(r))")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
         }
     }
 }
