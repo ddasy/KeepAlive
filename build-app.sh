@@ -22,6 +22,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleShortVersionString</key><string>1.0</string>
     <key>CFBundleExecutable</key>      <string>KeepAliveBar</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
+    <key>CFBundleIconFile</key>        <string>AppIcon</string>
     <key>LSMinimumSystemVersion</key>  <string>13.0</string>
     <key>LSUIElement</key>             <true/>
     <key>NSHighResolutionCapable</key> <true/>
@@ -35,8 +36,9 @@ swiftc -O -parse-as-library \
     "$DIR/KeepAliveBar.swift" \
     -o "$APP/Contents/MacOS/KeepAliveBar"
 
-echo "▶ 拷贝资源（Clawd 像素蟹图标）"
+echo "▶ 拷贝资源（Clawd 菜单栏图标 + App 图标）"
 cp "$DIR/assets/clawd.png" "$APP/Contents/Resources/clawd.png"
+cp "$DIR/assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 
 echo "▶ ad-hoc 签名"
 codesign --force --sign - "$APP"

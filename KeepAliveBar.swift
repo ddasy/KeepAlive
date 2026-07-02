@@ -63,8 +63,9 @@ final class Store: ObservableObject {
     }
     @Published var launchAtLogin: Bool = false
 
-    let bufferSec: TimeInterval = 90        // 真实重置时刻之后再等这么久才发
-    let minRefireSec: TimeInterval = 17400  // 防抖：两次保活最小间隔（4h50m）
+    let bufferSec: TimeInterval = 90        // 真实重置时刻之后再等这么久才发（确保旧窗口确已关闭）
+    let retryIntervalSec: TimeInterval = 180 // 两次“尝试”最小间隔：失败/未续窗时按此退避重试（3 分钟）
+    private var lastAttempt: Date?          // 上次尝试时间（成功/失败都记）
     let keychainService = "Claude Code-credentials"
     let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
 
@@ -159,19 +160,22 @@ final class Store: ObservableObject {
     func evaluateFire() {
         guard autoEnabled, !busyFiring else { return }
         let now = Date()
-        if let lf = lastFire, now.timeIntervalSince(lf) < minRefireSec { return }
-        guard let r = fiveReset else { return } // 无数据不乱发
+        // 距上次“尝试”不足 retryIntervalSec 则不动：
+        //  · 正常续窗成功后 → resets_at 前移约 5h，下面的窗口判据自然关闸
+        //  · 若发了却没成功续窗（失败 / 落进仍有剩余时间的旧窗口）→ resets_at 仍在过去，据此退避重试
+        if let la = lastAttempt, now.timeIntervalSince(la) < retryIntervalSec { return }
+        guard let r = fiveReset else { return } // 无用量数据不乱发
+        // 只有当“真实重置时刻已过”（窗口确已关闭、无剩余时间）才发；窗口还有剩余时间则继续等待
         if now.timeIntervalSince(r) >= bufferSec {
-            Task { await fire(manual: false) }
+            Task { await fire() }
         }
     }
 
-    func fireManual() { Task { await fire(manual: true) } }
-
-    func fire(manual: Bool) async {
+    func fire() async {
         if busyFiring { return }
         busyFiring = true
         defer { busyFiring = false }
+        lastAttempt = Date()   // 记录尝试时刻（成功/失败都算）→ 失败后按 retryIntervalSec 退避重试
         try? FileManager.default.createDirectory(atPath: workdir, withIntermediateDirectories: true)
         let env = baseEnv(); let wd = workdir
         // 空目录 + 禁 MCP + 去除 API key（走订阅）+ Haiku
@@ -183,11 +187,13 @@ final class Store: ObservableObject {
             let stamp = Date()
             lastFire = stamp
             UserDefaults.standard.set(stamp.timeIntervalSince1970, forKey: "lastFire")
-            lastFireResult = "\(manual ? "手动" : "自动")保活成功：\(String(trimmed.prefix(60)))"
-            log("FIRED (\(manual ? "manual" : "auto")) -> \(String(trimmed.prefix(100)))")
+            lastFireResult = "保活成功：\(String(trimmed.prefix(60)))"
+            log("FIRED -> \(String(trimmed.prefix(100)))")
         } else {
-            lastFireResult = "保活失败 (rc=\(r.code))：\(String(trimmed.prefix(120)))"
-            log("FAILED rc=\(r.code): \(String(trimmed.prefix(160)))")
+            // 失败：不更新 lastFire（窗口仍算未续），lastAttempt 已记 → retryIntervalSec 后自动重试
+            let mins = Int(retryIntervalSec / 60)
+            lastFireResult = "保活失败 (rc=\(r.code))，约 \(mins) 分钟后自动重试：\(String(trimmed.prefix(80)))"
+            log("FAILED rc=\(r.code) (retry in \(mins)m): \(String(trimmed.prefix(160)))")
         }
         Task { try? await Task.sleep(nanoseconds: 3_000_000_000); await refresh() }
     }
@@ -273,8 +279,9 @@ struct ContentView: View {
             )).toggleStyle(.switch).font(.caption)
 
             HStack(spacing: 8) {
-                Button(s.busyFiring ? "保活中…" : "立即保活") { s.fireManual() }
-                    .disabled(s.busyFiring)
+                if s.busyFiring {
+                    Text("保活中…").font(.caption2).foregroundStyle(.secondary)
+                }
                 Button("刷新") { s.refreshNow() }
                 Spacer()
                 Button("退出") { NSApp.terminate(nil) }
