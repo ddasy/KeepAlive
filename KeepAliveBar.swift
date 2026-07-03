@@ -10,10 +10,14 @@ import ServiceManagement
 // MARK: - 用量接口数据结构（对应 GET https://api.anthropic.com/api/oauth/usage）
 struct UsageResponse: Decodable {
     struct Bucket: Decodable { let utilization: Double?; let resets_at: String? }
+    // limits[] 里 kind=="session" 的条目带 is_active。⚠️实测（2026-07-03）：活动窗口期间它也是 false，
+    // 不能当“是否有活动窗口”用；仅解析出来记日志诊断。判定活动窗口用 five_hour.resets_at 是否在未来。
+    struct Limit: Decodable { let kind: String?; let is_active: Bool?; let resets_at: String?; let percent: Double? }
     let five_hour: Bucket?
     let seven_day: Bucket?
     let seven_day_opus: Bucket?
     let seven_day_sonnet: Bucket?
+    let limits: [Limit]?
 }
 
 // Codex 用量（来自 ~/.codex 会话日志里最后一条 rate_limits 快照，本地读取，无需联网）
@@ -61,7 +65,13 @@ enum Shell {
 @MainActor
 final class Store: ObservableObject {
     @Published var fivePct: Double?
-    @Published var fiveReset: Date?
+    @Published var fiveReset: Date?       // 接口原始 five_hour.resets_at（窗口过期后可能为 null → nil）
+    // windowEnd：我们信任并倒计时的“当前 5h 窗口结束时刻”。只要服务端返回未来的 five_hour.resets_at
+    // 就更新它；窗口过期后接口把 resets_at 变 null/过去，它保持粘滞（仍指向旧窗口末尾），
+    // 于是能可靠判定“已关闭”并续窗——不依赖 is_active（实测活动期间它也是 false，不可信）。
+    @Published var windowEnd: Date?
+    @Published var sessionActive: Bool?   // limits[session].is_active —— 仅记日志用，实测不可靠（活动期间也为 false）
+    @Published var lastRefresh: Date?     // 上次成功联网刷新时刻（调试用）
     @Published var sevenPct: Double?
     @Published var sevenReset: Date?
     @Published var opusPct: Double?
@@ -110,6 +120,7 @@ final class Store: ObservableObject {
         }
         try? FileManager.default.createDirectory(atPath: workdir, withIntermediateDirectories: true)
         launchAtLogin = (SMAppService.mainApp.status == .enabled)
+        log("APP start (autoEnabled=\(autoEnabled) paused=\(paused)) — 5 分钟后首次拉取")
         Task {   // 开机/程序启动后先等 5 分钟，再做首次拉取（避免开机瞬间抢跑）
             try? await Task.sleep(nanoseconds: 300_000_000_000)
             await refresh()
@@ -123,9 +134,9 @@ final class Store: ObservableObject {
     // 菜单栏标题：仅显示距 5h 窗口重置的剩余时间（图标已是 Clawd，去掉闪电标识）
     var menuTitle: String {
         if paused { return "⏸" }
-        guard let r = fiveReset else { return "–" }
-        let rem = r.timeIntervalSince(now)
-        return rem <= 0 ? "now" : Store.hhmm(rem)
+        guard let end = windowEnd else { return "–" }   // 还没见过任何活动窗口
+        let rem = end.timeIntervalSince(now)
+        return rem <= 0 ? "now" : Store.hhmm(rem)       // 已过末尾 → "now"（等待续窗）
     }
 
     nonisolated static func hhmm(_ s: TimeInterval) -> String {
@@ -171,6 +182,7 @@ final class Store: ObservableObject {
         guard !paused else { return }   // 暂停：仅停止 Claude 的 GET 与续窗（不影响上面的 Codex）
         guard let tok = await token() else {
             lastError = "无法读取 Keychain token（API-key 用户？或未授权 security 访问）"
+            log("REFRESH abort: 无法读取 Keychain token")
             return
         }
         var req = URLRequest(url: usageURL)
@@ -189,10 +201,20 @@ final class Store: ObservableObject {
             sevenPct = u.seven_day?.utilization;        sevenReset = parseISO(u.seven_day?.resets_at)
             opusPct = u.seven_day_opus?.utilization;    opusReset = parseISO(u.seven_day_opus?.resets_at)
             sonnetPct = u.seven_day_sonnet?.utilization; sonnetReset = parseISO(u.seven_day_sonnet?.resets_at)
+            sessionActive = u.limits?.first(where: { $0.kind == "session" })?.is_active   // 仅记日志，不做判断
             lastError = nil
             now = Date()
+            lastRefresh = now
+            // 只要服务端返回未来 reset，就更新 windowEnd；否则保持粘滞（见属性注释）。
+            // 这样窗口过期（接口返回 null / 过去值）时 windowEnd 仍指向旧窗口末尾 → 能判定“已关闭”并续窗。
+            // 保活刚开出的新窗口可能 utilization=0%，但 resets_at 已在未来；这仍是有效窗口。
+            let hasActiveWindow = fiveReset.map { $0.timeIntervalSince(now) > 0 } ?? false
+            if hasActiveWindow { windowEnd = fiveReset }
+            // 关键诊断日志：原始 resets_at / 用量 / is_active 全记下——下次窗口过期时这行会揭示接口的真实返回
+            log("REFRESH ok five=\(pctStr(fivePct)) rawReset=\(fmt(fiveReset)) sessionActive=\(boolStr(sessionActive)) → windowEnd=\(fmt(windowEnd)) (active=\(hasActiveWindow))")
         } catch {
             lastError = "查询失败: \(error.localizedDescription)"
+            log("REFRESH failed: \(error.localizedDescription)")
         }
     }
 
@@ -218,29 +240,36 @@ final class Store: ObservableObject {
         codexSnapshotAt = parseISO(roll.timestamp)
     }
 
-    // 纯本地判断：本地倒计时是否已过重置时刻。到点才触发一次“联网确认 + 续窗”，平时不联网
+    // 纯本地判断：本地倒计时（对 windowEnd）是否已过。到点才触发一次“联网确认 + 续窗”，平时不联网。
+    // 用粘滞的 windowEnd 而非原始 fiveReset：即使接口在过期后把 resets_at 变 null / 未来，
+    // windowEnd 仍指向旧窗口末尾（已过去）→ 能持续触发续窗与退避重试，不会像旧代码那样卡死。
     func maybeAct() {
         guard autoEnabled, !busyFiring, !acting else { return }
         let now = Date()
         // 距上次“尝试”不足 retryIntervalSec 则不动（失败/未续窗时按此退避重试）
         if let la = lastAttempt, now.timeIntervalSince(la) < retryIntervalSec { return }
-        guard let r = fiveReset else { return }   // 还没拿到时间
-        if now.timeIntervalSince(r) >= bufferSec { // 本地倒计时已归零 → 该续窗了
+        guard let end = windowEnd else { return }   // 还没追踪任何活动窗口 → 不动
+        if now.timeIntervalSince(end) >= bufferSec { // 本地倒计时已过窗口末尾 → 该确认并续窗
+            log("maybeAct → handleWindowClosed (windowEnd=\(fmt(end)) 已过 \(Int(now.timeIntervalSince(end)))s)")
             Task { await handleWindowClosed() }
         }
     }
 
-    // 到点了：先联网**确认**权威 resets_at（防本地缓存过期 / 用户已自行开新窗），仍关闭才发保活
+    // 到点了：先联网确认最新状态，再决定是否续窗。
+    // refresh() 会在“确有活动窗口（重置在未来）”时把 windowEnd 推到未来——
+    // 这只可能是用户自己开了新窗、或我们上次 fire 已成功。此时无需再发。
+    // 否则 windowEnd 仍是过去（旧窗口已关且没新窗口）→ 续窗。这样不依赖 is_active，也不会误判活动期。
     func handleWindowClosed() async {
         guard !acting, !busyFiring else { return }
         acting = true
         defer { acting = false }
-        await refresh()                               // 只有到点时才联网取最新 resets_at
-        guard let r = fiveReset else { return }
-        if Date().timeIntervalSince(r) >= bufferSec {  // 确认确已关闭、无剩余时间 → 续窗
-            await fire()
+        await refresh()   // 到点时联网取最新状态（会按需更新 windowEnd）
+        if let end = windowEnd, end.timeIntervalSince(Date()) > bufferSec {
+            log("窗口已（重新）激活 windowEnd=\(fmt(end)) util=\(pctStr(fivePct)) → 跳过续窗")
+            return                                     // 已有活动新窗口（用户已开 / 上次 fire 已成功）
         }
-        // 否则：窗口其实还有剩余时间（用户已开新窗 / 时钟偏差）→ 不发，回到本地倒计时
+        log("WINDOW CLOSED（windowEnd=\(fmt(windowEnd)) 最新 rawReset=\(fmt(fiveReset)) util=\(pctStr(fivePct))）→ fire")
+        await fire()                                   // 旧窗口确已关闭且无新窗口 → 续窗
     }
 
     func fire() async {
@@ -248,6 +277,7 @@ final class Store: ObservableObject {
         busyFiring = true
         defer { busyFiring = false }
         lastAttempt = Date()   // 记录尝试时刻（成功/失败都算）→ 失败后按 retryIntervalSec 退避重试
+        log("FIRE start: claude -p 'hi' --model haiku")
         try? FileManager.default.createDirectory(atPath: workdir, withIntermediateDirectories: true)
         let env = baseEnv(); let wd = workdir
         // 空目录 + 禁 MCP + 去除 API key（走订阅）+ Haiku
@@ -275,6 +305,7 @@ final class Store: ObservableObject {
     // 暂停 / 恢复：暂停后停止 GET 与续窗；恢复后立即刷新一次
     func togglePause() {
         paused.toggle()
+        log(paused ? "PAUSED（停止 GET 与续窗）" : "RESUMED（恢复监控）")
         if !paused { refreshNow() }
     }
 
@@ -293,6 +324,14 @@ final class Store: ObservableObject {
         launchAtLogin = (SMAppService.mainApp.status == .enabled)
         if on { SMAppService.openSystemSettingsLoginItems() }  // 跳转设置
     }
+
+    // 日志用小工具：时刻 / 百分比 / 可选 Bool 的紧凑字符串
+    func fmt(_ d: Date?) -> String {
+        guard let d = d else { return "nil" }
+        let f = DateFormatter(); f.dateFormat = "MM-dd HH:mm:ss"; return f.string(from: d)
+    }
+    func pctStr(_ p: Double?) -> String { p.map { "\(Int($0.rounded()))%" } ?? "—" }
+    func boolStr(_ b: Bool?) -> String { b.map { $0 ? "true" : "false" } ?? "nil" }
 
     func log(_ s: String) {
         try? FileManager.default.createDirectory(atPath: supportDir, withIntermediateDirectories: true)
@@ -331,8 +370,8 @@ struct ContentView: View {
     var nextFireText: String {
         if s.paused { return "已暂停（点“恢复”继续监控与续窗）" }
         if !s.autoEnabled { return "自动保活已关闭" }
-        guard let r = s.fiveReset else { return "下次保活：等待用量数据…" }
-        let rem = r.timeIntervalSince(s.now)
+        guard let end = s.windowEnd else { return "下次保活：等待用量数据…" }
+        let rem = end.timeIntervalSince(s.now)
         return rem > 0 ? "下次保活：约 \(Store.hhmm(rem)) 后" : "下次保活：即将执行"
     }
 
