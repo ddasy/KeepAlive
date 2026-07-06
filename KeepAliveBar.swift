@@ -153,6 +153,9 @@ final class Store: ObservableObject {
     @Published var paused: Bool {                                 // 暂停：停止 GET 与续窗
         didSet { UserDefaults.standard.set(paused, forKey: "paused") }
     }
+    @Published var autoQueryOnOpen: Bool {                        // 打开菜单栏弹窗时是否自动查询一次用量
+        didSet { UserDefaults.standard.set(autoQueryOnOpen, forKey: "autoQueryOnOpen") }
+    }
 
     let bufferSec: TimeInterval = 90        // 真实重置时刻之后再等这么久才发（确保旧窗口确已关闭）
     let retryIntervalSec: TimeInterval = 180 // 两次“尝试”最小间隔：失败/未续窗时按此退避重试（3 分钟）
@@ -170,6 +173,7 @@ final class Store: ObservableObject {
     init() {
         self.autoEnabled = (UserDefaults.standard.object(forKey: "autoEnabled") as? Bool) ?? true
         self.paused = UserDefaults.standard.bool(forKey: "paused")   // 默认 false
+        self.autoQueryOnOpen = (UserDefaults.standard.object(forKey: "autoQueryOnOpen") as? Bool) ?? true
         if let t = UserDefaults.standard.object(forKey: "lastFire") as? Double {
             self.lastFire = Date(timeIntervalSince1970: t)
         }
@@ -473,6 +477,11 @@ struct ContentView: View {
                     set: { s.setLaunchAtLogin($0) }
                 )).toggleStyle(.switch).labelsHidden()
             }
+            HStack {
+                Text("自动查询").font(.caption)
+                Spacer()
+                Toggle("", isOn: $s.autoQueryOnOpen).toggleStyle(.switch).labelsHidden()
+            }
 
             HStack(spacing: 8) {
                 Button(s.paused ? "恢复" : "暂停") { s.togglePause() }
@@ -496,7 +505,7 @@ struct ContentView: View {
         }
         .padding(14)
         .frame(width: 300)
-        .onAppear { s.refreshNow() }   // 打开弹窗时刷新一次用量（保证看到的是最新的）
+        .onAppear { if s.autoQueryOnOpen { s.refreshNow() } }   // 打开弹窗时按开关决定是否自动查询用量
     }
 
     @ViewBuilder
