@@ -236,9 +236,30 @@ final class Store: ObservableObject {
         return o["accessToken"] as? String
     }
 
+    // 代理是否开启：api.anthropic.com 需经代理才可达，未开代理时联网动作必失败。
+    // 与 keepalive.sh 的 proxy_enabled() 完全同一判断（复用同段 bash，避免两边漂移）：
+    //   1) 系统代理：HTTP / HTTPS / SOCKS 任一 Enable : 1
+    //   2) 纯 TUN/代理模式：默认路由走 utun 口且该口持有 fake-IP（198.18.0.0/15）
+    func proxyEnabled() async -> Bool {
+        let env = baseEnv()
+        let script = """
+        /usr/sbin/scutil --proxy 2>/dev/null | grep -qE '^[[:space:]]*(HTTPEnable|HTTPSEnable|SOCKSEnable)[[:space:]]*:[[:space:]]*1$' && exit 0
+        dev=$(/sbin/route -n get default 2>/dev/null | awk '/interface:/{print $2}')
+        case "$dev" in utun*) /sbin/ifconfig "$dev" 2>/dev/null | grep -qE 'inet 198\\.(18|19)\\.' && exit 0 ;; esac
+        exit 1
+        """
+        let r = await Task.detached { Shell.run("/bin/bash", ["-c", script], env: env) }.value
+        return r.code == 0
+    }
+
     func refresh() async {
         await readCodexUsage()          // Codex：本地读文件，不联网/不耗额度 → 不受暂停影响
         guard !paused else { return }   // 暂停：仅停止 Claude 的 GET 与续窗（不影响上面的 Codex）
+        guard await proxyEnabled() else {   // 前置条件：代理未开则跳过用量刷新（Codex 已在上方读完）
+            lastError = "代理未开启，已跳过用量刷新"
+            log("REFRESH abort: 代理未开启")
+            return
+        }
         guard let tok = await token() else {
             lastError = "无法读取 Keychain token（API-key 用户？或未授权 security 访问）"
             log("REFRESH abort: 无法读取 Keychain token")
@@ -322,6 +343,11 @@ final class Store: ObservableObject {
         guard !acting, !busyFiring else { return }
         acting = true
         defer { acting = false }
+        guard await proxyEnabled() else {   // 前置条件：代理未开则跳过本次续窗
+            lastAttempt = Date()            // 记一次尝试 → 按 retryIntervalSec 退避，避免 5s 一次刷日志
+            log("WINDOW CLOSED but 代理未开启 → 跳过续窗，稍后重试")
+            return
+        }
         await refresh()   // 到点时联网取最新状态（会按需更新 windowEnd）
         if let end = windowEnd, end.timeIntervalSince(Date()) > bufferSec {
             log("窗口已（重新）激活 windowEnd=\(fmt(end)) util=\(pctStr(fivePct)) → 跳过续窗")

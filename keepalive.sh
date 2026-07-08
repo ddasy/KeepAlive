@@ -85,9 +85,33 @@ fire_keepalive() {
   return $rc
 }
 
+# ---- 前置条件：代理是否开启 ------------------------------------------------
+# api.anthropic.com 需经代理才可达；未开代理时查 usage / 续窗都会失败或超时，
+# 故本次轮询直接跳过。两种模式都算"开启"：
+#   1) 系统代理：scutil 里 HTTP / HTTPS / SOCKS 任一 Enable : 1
+#   2) 纯 TUN/代理模式：默认路由走某个 utun 口，且该口持有 fake-IP（198.18.0.0/15）
+proxy_enabled() {
+  if /usr/sbin/scutil --proxy 2>/dev/null \
+       | grep -qE '^[[:space:]]*(HTTPEnable|HTTPSEnable|SOCKSEnable)[[:space:]]*:[[:space:]]*1$'; then
+    return 0
+  fi
+  local dev
+  dev=$(/sbin/route -n get default 2>/dev/null | awk '/interface:/{print $2}')
+  case "$dev" in
+    utun*) /sbin/ifconfig "$dev" 2>/dev/null | grep -qE 'inet 198\.(18|19)\.' && return 0 ;;
+  esac
+  return 1
+}
+
 # ============================================================================
 now=$(date +%s)
 last_fire=$(read_last_fire)
+
+if ! proxy_enabled; then
+  # 代理未开启 → 跳过本次（不查用量、不续窗）。保持安静，避免每次轮询刷日志。
+  : # log "🛑 代理未开启，跳过本次保活轮询"
+  exit 0
+fi
 
 token=$(get_token)
 if [ -z "$token" ]; then
