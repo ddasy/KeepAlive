@@ -225,6 +225,15 @@ final class Store: ObservableObject {
         return e
     }
 
+    // 保活专用的固定路径 claude 副本：身份（路径/cdhash）永不随每日自动更新变，
+    // 于是钥匙串“始终允许”一次点了能长期生效，不再每次到期都弹版本号授权框。
+    // 副本用 install-app.sh 复制生成（cp -p 保留 Anthropic Developer ID 签名）。
+    // 若副本缺失则退化为 PATH 里的 claude（仍能保活，只是会恢复每次弹框）。
+    var keepaliveClaudeBin: String {
+        let pinned = "\(home)/.local/share/claude/keepalive-claude"
+        return FileManager.default.isExecutableFile(atPath: pinned) ? pinned : "claude"
+    }
+
     func token() async -> String? {
         let env = baseEnv(); let svc = keychainService
         let r = await Task.detached {
@@ -364,10 +373,12 @@ final class Store: ObservableObject {
         lastAttempt = Date()   // 记录尝试时刻（成功/失败都算）→ 失败后按 retryIntervalSec 退避重试
         log("FIRE start: claude -p 'hi' --model haiku（脱钩：子进程自负钥匙串责任，避免弹授权框）")
         try? FileManager.default.createDirectory(atPath: workdir, withIntermediateDirectories: true)
-        let env = baseEnv(); let wd = workdir
+        let env = baseEnv(); let wd = workdir; let bin = keepaliveClaudeBin
         // 空目录 + 禁 MCP + 去除 API key（走订阅）+ Haiku
+        // 用固定路径副本（keepaliveClaudeBin）而非 PATH 里天天更新的 claude，
+        // 让钥匙串授权对象身份稳定，避免每次到期都弹版本号授权框。
         let cmd = "cd '\(wd)' && exec env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN " +
-                  "claude -p 'hi' --model haiku --strict-mcp-config"
+                  "'\(bin)' -p 'hi' --model haiku --strict-mcp-config"
         // 用 runDisclaimed 而非 run：claude 刷新 OAuth token 写钥匙串时不再算到本 App（ad-hoc 签名）头上，
         // 从而不再每次弹“允许访问钥匙串”框（详见 Shell.runDisclaimed 注释）。
         let r = await Task.detached { Shell.runDisclaimed("/bin/bash", ["-c", cmd], env: env) }.value

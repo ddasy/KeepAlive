@@ -21,7 +21,16 @@ set -uo pipefail
 
 # ---- 配置（可用环境变量覆盖）------------------------------------------------
 KA_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CLAUDE_BIN="${KA_CLAUDE_BIN:-$HOME/.local/bin/claude}"
+# 优先用保活专用的固定路径副本（身份不随每日自动更新变 → 钥匙串“始终允许”长期有效，
+# 不再每次到期弹版本号授权框）；副本缺失时退化为 PATH 里的 claude。可用 KA_CLAUDE_BIN 覆盖。
+CLAUDE_BIN="${KA_CLAUDE_BIN:-}"
+if [ -z "$CLAUDE_BIN" ]; then
+  if [ -x "$HOME/.local/share/claude/keepalive-claude" ]; then
+    CLAUDE_BIN="$HOME/.local/share/claude/keepalive-claude"
+  else
+    CLAUDE_BIN="$HOME/.local/bin/claude"
+  fi
+fi
 # 保活消息从这个**项目内空目录**发起：避免读入任何目录内容/CLAUDE.md/git 上下文
 KA_WORKDIR="${KA_WORKDIR:-$KA_HOME/null}"
 KEYCHAIN_SERVICE="${KA_KEYCHAIN_SERVICE:-Claude Code-credentials}"

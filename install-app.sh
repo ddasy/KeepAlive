@@ -6,6 +6,21 @@ DEST="/Applications/KeepAliveBar.app"
 
 [ -d "$DIR/KeepAliveBar.app" ] || bash "$DIR/build-app.sh"
 
+# 生成/刷新保活专用的固定路径 claude 副本：身份不随每日自动更新变，
+# 让钥匙串“始终允许”长期生效，避免每次到期弹版本号授权框。
+PINNED="$HOME/.local/share/claude/keepalive-claude"
+SRC="$(readlink -f "$HOME/.local/bin/claude" 2>/dev/null || true)"
+if [ -n "$SRC" ] && [ -x "$SRC" ]; then
+  if [ ! -x "$PINNED" ]; then
+    echo "▶ 生成保活专用固定副本 keepalive-claude（源：$SRC）"
+    cp -p "$SRC" "$PINNED" && echo "  ✅ $PINNED"
+  else
+    echo "▶ 保活固定副本已存在，跳过（如需升级：rm '$PINNED' 后重跑本脚本，再在下次到期点一次“始终允许”）"
+  fi
+else
+  echo "  ⚠️ 未找到 ~/.local/bin/claude，跳过固定副本；保活会退化为 PATH 里的 claude（会恢复每次弹框）"
+fi
+
 echo "▶ 复制到 /Applications"
 rm -rf "$DEST"
 cp -R "$DIR/KeepAliveBar.app" "$DEST"
