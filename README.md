@@ -1,7 +1,8 @@
-# Claude Code 5 小时窗口 · 精确保活 (KeepAlive)
+# Claude Code / Codex 5 小时窗口 · 精确保活 (KeepAlive)
 
 在你不工作的时段，自动、**精确地**在每个 5 小时窗口关闭后立刻发一条极小消息，
-开启下一个 5 小时窗口 —— 让窗口的时钟在闲置时段就开始走，等你真正干活时能拿到更多次满额窗口。
+开启下一个 5 小时窗口。Claude 使用官方 usage reset；Codex 使用本地 rollout 日志里的
+`rate_limits.primary.resets_at`。如果 Codex 从未启动过、没有任何时间快照，则首次观察后等待 5 小时发送一条 `hi` 激活，之后自动按 reset 续窗。
 
 ## 它凭什么“精确”
 
@@ -33,12 +34,12 @@ anthropic-beta: oauth-2025-04-20
 
 | 文件 | 作用 |
 |---|---|
-| `KeepAliveBar.swift` | 菜单栏 App 源码（SwiftUI `MenuBarExtra`） |
+| `KeepAliveBar.swift` | 菜单栏 App 源码（SwiftUI `MenuBarExtra`，同时自动激活 Claude/Codex） |
 | `build-app.sh` | 编译并打包成 `KeepAliveBar.app`（菜单栏 Agent，无 Dock 图标） |
 | `install-app.sh` | 可选：装到 `/Applications` + 设开机自启 |
 | `null/` | 保活消息从这个空目录发起（避免读入任何上下文） |
-| `keepalive.sh` | launchd 版核心：查 usage → 判断 → 必要时发保活 |
-| `status.sh` | **只读**面板：打印 5h/周用量 + 真实重置时间。随时可跑，不发消息 |
+| `keepalive.sh` | launchd 版核心：查 Claude usage / Codex 快照 → 判断 → 必要时发保活 |
+| `status.sh` | **只读**面板：打印 Claude/Codex 用量、重置时间和自动激活状态。随时可跑，不发消息 |
 | `com.iu.claude-keepalive.plist` | launchd LaunchAgent 模板 |
 | `install.sh` / `uninstall.sh` | 启用 / 停用 launchd 后台服务 |
 | `keepalive.log` / `state.json` | launchd 版的日志与状态 |
@@ -54,9 +55,9 @@ open KeepAliveBar.app             # 启动，菜单栏出现 ⚡︎ 图标
 bash install-app.sh
 ```
 
-菜单栏图标显示距 5h 窗口重置的倒计时（如 `⚡︎ 1h35m`）；点击弹窗有：5h/周 用量进度条 +
-精确重置时间、`自动保活`开关、`开机自启`开关、`立即保活` / `刷新` / `退出`。开着它、`自动保活`打开，
-窗口一关就会自动续下一个 5h。若首次弹出「KeepAliveBar 想访问钥匙串」，点**始终允许**。
+菜单栏图标显示 Claude 距 5h 窗口重置的倒计时；点击弹窗有 Claude/Codex 的 5h/周用量、
+重置时间、`自动保活`开关、`开机自启`开关、`刷新` / `退出`。开着它、`自动保活`打开，
+Claude 窗口一关会自动续窗；Codex 在已有 reset 快照时到期续窗，没有快照时连续 5 小时后发送 `hi`。
 
 **开机自启**：勾选后用 `SMAppService` 注册登录项并跳转「系统设置 ▸ 通用 ▸ 登录项」让你确认
 （普通 App 登录项其实是**秒开、无需密码**）。登录项绑定 App 当前所在路径，所以**建议先
@@ -93,6 +94,12 @@ bash uninstall.sh
 | `KA_BUFFER_SEC` | `90` | 真实重置时刻之后再等多少秒才发（确保旧窗口彻底关闭） |
 | `KA_MIN_REFIRE_SEC` | `17400` | 防抖：两次保活最小间隔（4h50m） |
 | `KA_WEEKLY_GUARD_PCT` | `101` | 周用量≥此百分比时暂停保活（默认永不触发；设 90 可省额度） |
+| `KA_CODEX_BIN` | 自动查找 | Codex CLI 路径 |
+| `KA_CODEX_MODEL` | `gpt-5.4-mini` | Codex 保活模型 |
+| `KA_CODEX_EFFORT` | `low` | Codex reasoning effort |
+| `KA_CODEX_PROMPT` | `hi` | Codex 保活消息，建议保持为 `hi` |
+| `KA_CODEX_FALLBACK_SEC` | `18000` | 没有 Codex reset 快照时，等待 5 小时再首次激活 |
+| `KA_CODEX_MIN_REFIRE_SEC` | `17400` | Codex 两次激活最小间隔（4h50m） |
 | 轮询频率 | plist `StartInterval=300` | 调小 → 窗口衔接更紧密，但请求更频繁 |
 
 ## ⚠️ 重要前提与风险（务必了解）

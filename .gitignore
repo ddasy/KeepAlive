@@ -5,6 +5,7 @@ KeepAliveBar.app/
 null/
 *.log
 state.json
+codex-state.json
 
 # macOS
 .DS_Store

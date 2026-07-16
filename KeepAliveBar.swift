@@ -25,9 +25,12 @@ struct UsageResponse: Decodable {
 struct CodexRollout: Decodable {
     struct Payload: Decodable {
         struct RL: Decodable {
-            struct Bucket: Decodable { let used_percent: Double?; let resets_at: Double? }
-            let primary: Bucket?      // 5 小时
-            let secondary: Bucket?    // 周
+            // ⚠️ primary/secondary 槽位并非固定对应 5h/周——要看 window_minutes 判定：
+            // window_minutes≈300 → 5 小时窗口；≈10080 → 7 天(周)窗口。空闲(仅 hi 保活)的快照往往
+            // 只带一个“周”窗口且放在 primary、secondary 缺失、5h 窗口整段消失。切勿按槽位当 5h/周。
+            struct Bucket: Decodable { let used_percent: Double?; let resets_at: Double?; let window_minutes: Double? }
+            let primary: Bucket?
+            let secondary: Bucket?
             let plan_type: String?
         }
         let rate_limits: RL?
@@ -141,6 +144,8 @@ final class Store: ObservableObject {
     @Published var codexWeeklyUsed: Double?
     @Published var codexWeeklyReset: Date?
     @Published var codexSnapshotAt: Date?
+    @Published var codexLastFire: Date?
+    @Published var codexLastFireResult: String = ""
     @Published var lastError: String?
     @Published var lastFire: Date?
     @Published var lastFireResult: String = ""
@@ -159,7 +164,15 @@ final class Store: ObservableObject {
 
     let bufferSec: TimeInterval = 90        // 真实重置时刻之后再等这么久才发（确保旧窗口确已关闭）
     let retryIntervalSec: TimeInterval = 180 // 两次“尝试”最小间隔：失败/未续窗时按此退避重试（3 分钟）
+    let codexBufferSec: TimeInterval = 90
+    let codexRetryIntervalSec: TimeInterval = 180
+    let codexFallbackSec: TimeInterval = 18000 // 没有 reset 快照时，连续 5 小时后首次激活
+    let codexMinRefireSec: TimeInterval = 17400 // 成功后至少 4h50m 不重复发送
     private var lastAttempt: Date?          // 上次尝试时间（成功/失败都记）
+    private var codexLastAttempt: Date?
+    private var codexNoSnapshotSince: Date?
+    private var lastCodexPoll: Date?
+    private var codexActing = false
     let keychainService = "Claude Code-credentials"
     let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
 
@@ -177,6 +190,15 @@ final class Store: ObservableObject {
         if let t = UserDefaults.standard.object(forKey: "lastFire") as? Double {
             self.lastFire = Date(timeIntervalSince1970: t)
         }
+        if let t = UserDefaults.standard.object(forKey: "codexLastFire") as? Double {
+            self.codexLastFire = Date(timeIntervalSince1970: t)
+        }
+        if let t = UserDefaults.standard.object(forKey: "codexLastAttempt") as? Double {
+            self.codexLastAttempt = Date(timeIntervalSince1970: t)
+        }
+        if let t = UserDefaults.standard.object(forKey: "codexNoSnapshotSince") as? Double {
+            self.codexNoSnapshotSince = Date(timeIntervalSince1970: t)
+        }
         try? FileManager.default.createDirectory(atPath: workdir, withIntermediateDirectories: true)
         launchAtLogin = (SMAppService.mainApp.status == .enabled)
         log("APP start (autoEnabled=\(autoEnabled) paused=\(paused)) — 5 分钟后首次拉取")
@@ -187,6 +209,27 @@ final class Store: ObservableObject {
         // 本地倒计时 + 到点判断；不再定时轮询接口（resets_at 在一个 5h 窗口内固定不变）
         tickTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
+        }
+        warmupIfNeeded()
+    }
+
+    // 首次启动“授权预热”：只跑一次（didWarmup 标记）。趁用户在场，主动各 fire 一次 claude / codex，
+    // 让本来只有到期执行任务时才冒出来的系统授权框（claude 读/写钥匙串、codex 若碰保护目录的文件访问）
+    // 提前弹出来，用户当场点“始终允许”，而不是在某个 5h 边界随机冒出、阻塞续窗。
+    //   · claude fire → 读 Keychain「Claude Code-credentials」→ 弹一次“始终允许”（钉在固定路径副本
+    //     keepalive-claude 上，身份稳定，点一次长期有效）。这是预热的主要价值。
+    //   · codex fire → 确认登录态可用；注意保活的 codex 从 App Support（非保护目录）发起，本就不需要
+    //     “访问桌面”授权，所以预热不会（也无法）复现你在 ~/Desktop 里跑 codex 时的 node 授权框——
+    //     那个由 `brew pin node`（冻结 node 版本、路径不再漂移）根治，不靠预热。
+    // 想重新触发预热：删掉 UserDefaults 的 didWarmup 键即可。
+    func warmupIfNeeded() {
+        guard !UserDefaults.standard.bool(forKey: "didWarmup") else { return }
+        UserDefaults.standard.set(true, forKey: "didWarmup")   // 先落标记：即便本次失败也不反复打扰
+        log("WARMUP: 首次启动 → 主动各跑一次 claude/codex，触发系统授权（钥匙串/文件访问），请在弹框点“始终允许”")
+        Task { [weak self] in
+            guard let self else { return }
+            await self.fire()        // 触发 claude 读/写钥匙串 → 首次弹“始终允许”
+            await self.fireCodex()   // 首次跑一次 codex，确认登录态/授权可用
         }
     }
 
@@ -216,6 +259,15 @@ final class Store: ObservableObject {
         guard !paused else { return }   // 暂停：不倒计时、不联网、不续窗
         now = Date()   // 本地倒计时（不联网）
         maybeAct()     // 只有到点了才会去联网确认并续窗
+        // Codex 的 reset 来自本地 rollout 快照，每 5 分钟读一次；没有快照时也由这里累计 5 小时。
+        if lastCodexPoll == nil || now.timeIntervalSince(lastCodexPoll!) >= 300 {
+            lastCodexPoll = now
+            Task { [weak self] in
+                guard let self else { return }
+                await self.readCodexUsage()
+                self.maybeActCodex()
+            }
+        }
     }
 
     func baseEnv() -> [String: String] {
@@ -234,15 +286,48 @@ final class Store: ObservableObject {
         return FileManager.default.isExecutableFile(atPath: pinned) ? pinned : "claude"
     }
 
-    func token() async -> String? {
+    var keepaliveCodexBin: String {
+        let candidates = [
+            "\(home)/.local/bin/codex",
+            "/opt/homebrew/bin/codex",
+            "/usr/local/bin/codex"
+        ]
+        return candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) ?? "/usr/bin/env"
+    }
+
+    var keepaliveCodexUsesEnv: Bool { keepaliveCodexBin == "/usr/bin/env" }
+
+    // 读取 Keychain 凭据。返回 accessToken + 过期时刻(ms) + 失败诊断串（供日志精确定位）。
+    // ⚠️ 绝不记录 token 本身；仅在失败时把 security 的退出码与错误输出（截断）带回来——
+    //   security 成功时 out 是明文 token，只有 rc!=0 时 out 才是报错文本（item not found / auth denied 等）。
+    struct Credential { let accessToken: String?; let expiresAtMs: Double?; let diag: String }
+    func readCredential() async -> Credential {
         let env = baseEnv(); let svc = keychainService
         let r = await Task.detached {
             Shell.run("/usr/bin/security", ["find-generic-password", "-s", svc, "-w"], env: env)
         }.value
-        guard r.code == 0, let d = r.out.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return nil }
+        guard r.code == 0 else {
+            let msg = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
+            return Credential(accessToken: nil, expiresAtMs: nil,
+                              diag: "security rc=\(r.code) \(String(msg.prefix(140)))")
+        }
+        guard let d = r.out.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else {
+            return Credential(accessToken: nil, expiresAtMs: nil, diag: "凭据 JSON 解析失败")
+        }
         let o = (obj["claudeAiOauth"] as? [String: Any]) ?? obj
-        return o["accessToken"] as? String
+        let tok = o["accessToken"] as? String
+        let exp = (o["expiresAt"] as? NSNumber)?.doubleValue
+        return Credential(accessToken: tok, expiresAtMs: exp,
+                          diag: tok == nil ? "凭据里无 accessToken 字段（API-key 用户？）" : "")
+    }
+
+    // token 过期状态的紧凑串：把剩余寿命算出来，供 401 时对照（过期→大概率就是 401 主因）。
+    func tokenExpStr(_ expiresAtMs: Double?) -> String {
+        guard let ms = expiresAtMs else { return "未知" }
+        let exp = Date(timeIntervalSince1970: ms / 1000)
+        let rem = exp.timeIntervalSince(Date())
+        return "\(fmt(exp))(\(rem >= 0 ? "剩\(Int(rem / 60))m" : "已过期\(Int(-rem / 60))m"))"
     }
 
     // 代理是否开启：api.anthropic.com 需经代理才可达，未开代理时联网动作必失败。
@@ -263,17 +348,20 @@ final class Store: ObservableObject {
 
     func refresh() async {
         await readCodexUsage()          // Codex：本地读文件，不联网/不耗额度 → 不受暂停影响
+        maybeActCodex()
         guard !paused else { return }   // 暂停：仅停止 Claude 的 GET 与续窗（不影响上面的 Codex）
         guard await proxyEnabled() else {   // 前置条件：代理未开则跳过用量刷新（Codex 已在上方读完）
             lastError = "代理未开启，已跳过用量刷新"
             log("REFRESH abort: 代理未开启")
             return
         }
-        guard let tok = await token() else {
-            lastError = "无法读取 Keychain token（API-key 用户？或未授权 security 访问）"
-            log("REFRESH abort: 无法读取 Keychain token")
+        let cred = await readCredential()
+        guard let tok = cred.accessToken else {
+            lastError = "无法读取 Keychain token（\(cred.diag)）"
+            log("REFRESH abort: 无法读取 Keychain token — \(cred.diag)")
             return
         }
+        let tokExp = tokenExpStr(cred.expiresAtMs)
         var req = URLRequest(url: usageURL)
         req.httpMethod = "GET"
         req.setValue("Bearer \(tok)", forHTTPHeaderField: "Authorization")
@@ -283,7 +371,13 @@ final class Store: ObservableObject {
         do {
             let (data, resp) = try await URLSession.shared.data(for: req)
             if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
-                lastError = "usage HTTP \(http.statusCode)"; return
+                // 关键诊断：状态码 + token 过期状态 + 服务端错误体（含 authentication_error 等具体类型）。
+                // 401 时这行能一眼分清是「token 已过期」还是「被吊销/无效」，不再只看到红字一闪。
+                let body = (String(data: data, encoding: .utf8) ?? "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                lastError = "usage HTTP \(http.statusCode)"
+                log("REFRESH http \(http.statusCode) tokenExp=\(tokExp) body=\(String(body.prefix(220)))")
+                return
             }
             let u = try JSONDecoder().decode(UsageResponse.self, from: data)
             fivePct = u.five_hour?.utilization;         fiveReset = parseISO(u.five_hour?.resets_at)
@@ -300,10 +394,13 @@ final class Store: ObservableObject {
             let hasActiveWindow = fiveReset.map { $0.timeIntervalSince(now) > 0 } ?? false
             if hasActiveWindow { windowEnd = fiveReset }
             // 关键诊断日志：原始 resets_at / 用量 / is_active 全记下——下次窗口过期时这行会揭示接口的真实返回
-            log("REFRESH ok five=\(pctStr(fivePct)) rawReset=\(fmt(fiveReset)) sessionActive=\(boolStr(sessionActive)) → windowEnd=\(fmt(windowEnd)) (active=\(hasActiveWindow))")
+            log("REFRESH ok five=\(pctStr(fivePct)) rawReset=\(fmt(fiveReset)) tokenExp=\(tokExp) sessionActive=\(boolStr(sessionActive)) → windowEnd=\(fmt(windowEnd)) (active=\(hasActiveWindow))")
         } catch {
+            // 带上 NSError 的 domain#code：区分连接中断(-1005)/超时(-1001)/离线(-1009)/SSL(-1200) 等，
+            // 对代理不稳的场景特别有用——localizedDescription 三种都可能是「网络连接已丢失」。
+            let ns = error as NSError
             lastError = "查询失败: \(error.localizedDescription)"
-            log("REFRESH failed: \(error.localizedDescription)")
+            log("REFRESH failed: \(ns.domain)#\(ns.code) \(error.localizedDescription)")
         }
     }
 
@@ -322,11 +419,116 @@ final class Store: ObservableObject {
         }
         codexAvailable = true
         codexPlan = rl.plan_type
-        codexPrimaryUsed = rl.primary?.used_percent
-        codexPrimaryReset = rl.primary?.resets_at.map { Date(timeIntervalSince1970: $0) }
-        codexWeeklyUsed = rl.secondary?.used_percent
-        codexWeeklyReset = rl.secondary?.resets_at.map { Date(timeIntervalSince1970: $0) }
+        // 按 window_minutes 归类，而不是按 primary/secondary 槽位（见 Bucket 注释）。
+        // 5h 窗口：window_minutes ≤ 360；周窗口：≥ 1440。
+        let buckets = [rl.primary, rl.secondary].compactMap { $0 }
+        let hasWindowInfo = buckets.contains { $0.window_minutes != nil }
+        let five: CodexRollout.Payload.RL.Bucket?
+        let weekly: CodexRollout.Payload.RL.Bucket?
+        if hasWindowInfo {
+            five = buckets.first { ($0.window_minutes ?? .infinity) <= 360 }
+            weekly = buckets.first { ($0.window_minutes ?? 0) >= 1440 }
+        } else {
+            // 老格式没有 window_minutes → 回退旧假设（primary=5h / secondary=周）。
+            five = rl.primary; weekly = rl.secondary
+        }
+        // 5h 窗口：优先用快照里真正的 5h 窗口(通常只在有实际用量的会话里出现)；
+        // 保活 hi 的快照往往只带“周”窗口、没有 5h 窗口 → 用“上次 fire + 5h”估算 5h 重置，
+        // 既给出倒计时、又驱动在 fire 后约 5h 精确续窗，绝不把周 reset 误当 5h reset。
+        if let five = five, let ra = five.resets_at {
+            codexPrimaryUsed = five.used_percent
+            codexPrimaryReset = Date(timeIntervalSince1970: ra)
+        } else if let lf = codexLastFire {
+            codexPrimaryUsed = nil                                  // 5h 真实用量未知
+            codexPrimaryReset = lf.addingTimeInterval(codexFallbackSec)   // ≈ 上次 fire + 5h
+        } else {
+            codexPrimaryUsed = nil                                  // 从未 fire 过 → 交给时间兜底计时
+            codexPrimaryReset = nil
+        }
+        codexWeeklyUsed = weekly?.used_percent
+        codexWeeklyReset = weekly?.resets_at.map { Date(timeIntervalSince1970: $0) }
         codexSnapshotAt = parseISO(roll.timestamp)
+    }
+
+    // Codex 没有公开 usage 查询接口：有本地 reset 就按 reset 续窗；没有时间时，
+    // 首次观察开始计时，连续 5 小时后发送一次 hi 激活，随后等待新的 rollout 快照。
+    func maybeActCodex() {
+        guard autoEnabled, !paused, !busyFiring, !acting, !codexActing else { return }
+        let current = Date()
+        if let reset = codexPrimaryReset, reset.timeIntervalSince(current) > codexBufferSec {
+            codexNoSnapshotSince = nil
+            UserDefaults.standard.removeObject(forKey: "codexNoSnapshotSince")
+            return
+        }
+
+        var ready = false
+        if let reset = codexPrimaryReset {
+            ready = current.timeIntervalSince(reset) >= codexBufferSec
+        } else {
+            if codexNoSnapshotSince == nil {
+                codexNoSnapshotSince = current
+                UserDefaults.standard.set(current.timeIntervalSince1970, forKey: "codexNoSnapshotSince")
+                log("CODEX no reset snapshot — 开始 5 小时激活计时")
+            }
+            ready = current.timeIntervalSince(codexNoSnapshotSince!) >= codexFallbackSec
+        }
+        guard ready else { return }
+        if let attempt = codexLastAttempt, current.timeIntervalSince(attempt) < codexRetryIntervalSec { return }
+        if let fire = codexLastFire, current.timeIntervalSince(fire) < codexMinRefireSec { return }
+        Task { await fireCodex() }
+    }
+
+    func fireCodex() async {
+        guard !codexActing else { return }
+        codexActing = true
+        defer { codexActing = false }
+        let attempt = Date()
+        codexLastAttempt = attempt
+        UserDefaults.standard.set(attempt.timeIntervalSince1970, forKey: "codexLastAttempt")
+        log("CODEX FIRE start: codex exec 'hi' --model gpt-5.4-mini --effort low")
+        try? FileManager.default.createDirectory(atPath: workdir, withIntermediateDirectories: true)
+
+        let env = baseEnv()
+        let command = keepaliveCodexUsesEnv ? "/usr/bin/env" : keepaliveCodexBin
+        var args = keepaliveCodexUsesEnv ? ["codex"] : []
+        args += [
+            "--ask-for-approval", "never",
+            "exec", "--model", "gpt-5.4-mini",
+            "-c", "model_reasoning_effort=low",
+            // 强制直连 HTTP(responses)、跳过 websocket。codex 默认先连 wss://chatgpt.com/.../responses，
+            // 网络不稳时这一步常 403/超时后才降级 HTTP，白等一截、还不确定。内置 openai provider 不可覆盖，
+            // 故另起一个自定义 provider：requires_openai_auth=true 复用 ChatGPT 订阅登录态（不走 API key 计费），
+            // supports_websockets=false 关掉 websocket → 直连 HTTP，确定性更好。
+            // 注：base_url 硬编码为 ChatGPT codex 后端；若官方改址，此处需同步（fire 会失败并重试、日志可见）。
+            "-c", "model_provider=chatgpt-httponly",
+            "-c", "model_providers.chatgpt-httponly.name=chatgpt-httponly",
+            "-c", "model_providers.chatgpt-httponly.base_url=https://chatgpt.com/backend-api/codex",
+            "-c", "model_providers.chatgpt-httponly.wire_api=responses",
+            "-c", "model_providers.chatgpt-httponly.requires_openai_auth=true",
+            "-c", "model_providers.chatgpt-httponly.supports_websockets=false",
+            "--cd", workdir,
+            "--skip-git-repo-check", "--ignore-user-config", "--ignore-rules",
+            "--sandbox", "read-only", "hi"
+        ]
+        var cleanEnv = env
+        cleanEnv.removeValue(forKey: "OPENAI_API_KEY")
+        cleanEnv.removeValue(forKey: "OPENAI_BASE_URL")
+        let r = await Task.detached {
+            Shell.runDisclaimed(command, args, env: cleanEnv)
+        }.value
+        let trimmed = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
+        if r.code == 0 {
+            let stamp = Date()
+            codexLastFire = stamp
+            UserDefaults.standard.set(stamp.timeIntervalSince1970, forKey: "codexLastFire")
+            codexLastFireResult = "Codex 激活成功：\(String(trimmed.prefix(60)))"
+            log("CODEX FIRED -> \(String(trimmed.prefix(120)))")
+        } else {
+            let mins = Int(codexRetryIntervalSec / 60)
+            codexLastFireResult = "Codex 激活失败 (rc=\(r.code))，约 \(mins) 分钟后重试：\(String(trimmed.prefix(80)))"
+            log("CODEX FAILED rc=\(r.code) (retry in \(mins)m): \(String(trimmed.prefix(180)))")
+        }
+        Task { try? await Task.sleep(nanoseconds: 3_000_000_000); await readCodexUsage() }
     }
 
     // 纯本地判断：本地倒计时（对 windowEnd）是否已过。到点才触发一次“联网确认 + 续窗”，平时不联网。
@@ -486,18 +688,16 @@ struct ContentView: View {
             if s.opusPct != nil { usageRow("周 · Opus", s.opusPct, s.opusReset) }
             if s.sonnetPct != nil { usageRow("周 · Sonnet", s.sonnetPct, s.sonnetReset) }
 
-            if s.codexAvailable {
-                Divider()
-                HStack {
-                    Text("Codex").font(.headline)
-                    Spacer()
-                    if let p = s.codexPlan {
-                        Text(p).font(.caption2).foregroundStyle(.secondary)
-                    }
+            Divider()
+            HStack {
+                Text("Codex").font(.headline)
+                Spacer()
+                if let p = s.codexPlan {
+                    Text(p).font(.caption2).foregroundStyle(.secondary)
                 }
-                codexRow("5 小时", s.codexPrimaryUsed, s.codexPrimaryReset, withDate: false)
-                codexRow("周限", s.codexWeeklyUsed, s.codexWeeklyReset, withDate: true)
             }
+            codexRow("5 小时", s.codexPrimaryUsed, s.codexPrimaryReset, withDate: false)
+            codexRow("周限", s.codexWeeklyUsed, s.codexWeeklyReset, withDate: true)
 
             Divider()
             Text(nextFireText).font(.caption).foregroundStyle(.secondary)
@@ -534,7 +734,13 @@ struct ContentView: View {
                 Text(s.lastFireResult).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
             }
             if let lf = s.lastFire {
-                Text("上次保活：\(localMDHM(lf))").font(.caption2).foregroundStyle(.secondary)
+                Text("上次 Claude 保活：\(localMDHM(lf))").font(.caption2).foregroundStyle(.secondary)
+            }
+            if let lf = s.codexLastFire {
+                Text("上次 Codex 保活：\(localMDHM(lf))").font(.caption2).foregroundStyle(.secondary)
+            }
+            if !s.codexLastFireResult.isEmpty {
+                Text(s.codexLastFireResult).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
             }
             if let e = s.lastError {
                 Text(e).font(.caption2).foregroundStyle(.red).lineLimit(2)
@@ -577,6 +783,8 @@ struct ContentView: View {
             } else if let r = reset {
                 Text(withDate ? "重置时间 \(localMonthDayHM(r))" : "重置 \(localHM(r))")
                     .font(.caption2).foregroundStyle(.secondary)
+            } else {
+                Text("暂无快照").font(.caption2).foregroundStyle(.secondary)
             }
         }
     }
