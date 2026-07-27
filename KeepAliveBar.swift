@@ -127,7 +127,15 @@ final class Store: ObservableObject {
     // windowEnd：我们信任并倒计时的“当前 5h 窗口结束时刻”。只要服务端返回未来的 five_hour.resets_at
     // 就更新它；窗口过期后接口把 resets_at 变 null/过去，它保持粘滞（仍指向旧窗口末尾），
     // 于是能可靠判定“已关闭”并续窗——不依赖 is_active（实测活动期间它也是 false，不可信）。
-    @Published var windowEnd: Date?
+    @Published var windowEnd: Date? {
+        didSet {
+            if let end = windowEnd {
+                UserDefaults.standard.set(end.timeIntervalSince1970, forKey: "windowEnd")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "windowEnd")
+            }
+        }
+    }
     @Published var sessionActive: Bool?   // limits[session].is_active —— 仅记日志用，实测不可靠（活动期间也为 false）
     @Published var lastRefresh: Date?     // 上次成功联网刷新时刻（调试用）
     @Published var sevenPct: Double?
@@ -164,6 +172,7 @@ final class Store: ObservableObject {
 
     let bufferSec: TimeInterval = 90        // 真实重置时刻之后再等这么久才发（确保旧窗口确已关闭）
     let retryIntervalSec: TimeInterval = 180 // 两次“尝试”最小间隔：失败/未续窗时按此退避重试（3 分钟）
+    let refreshRetryIntervalSec: TimeInterval = 180 // 用量查询失败/缺少窗口时间时，3 分钟后自动重查
     let codexBufferSec: TimeInterval = 90
     let codexRetryIntervalSec: TimeInterval = 180
     let codexFallbackSec: TimeInterval = 18000 // 没有 reset 快照时，连续 5 小时后首次激活
@@ -173,6 +182,7 @@ final class Store: ObservableObject {
     private var codexNoSnapshotSince: Date?
     private var lastCodexPoll: Date?
     private var codexActing = false
+    private var refreshRetryTask: Task<Void, Never>?
     let keychainService = "Claude Code-credentials"
     let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
 
@@ -187,6 +197,9 @@ final class Store: ObservableObject {
         self.autoEnabled = (UserDefaults.standard.object(forKey: "autoEnabled") as? Bool) ?? true
         self.paused = UserDefaults.standard.bool(forKey: "paused")   // 默认 false
         self.autoQueryOnOpen = (UserDefaults.standard.object(forKey: "autoQueryOnOpen") as? Bool) ?? true
+        if let t = UserDefaults.standard.object(forKey: "windowEnd") as? Double {
+            self.windowEnd = Date(timeIntervalSince1970: t)
+        }
         if let t = UserDefaults.standard.object(forKey: "lastFire") as? Double {
             self.lastFire = Date(timeIntervalSince1970: t)
         }
@@ -201,9 +214,13 @@ final class Store: ObservableObject {
         }
         try? FileManager.default.createDirectory(atPath: workdir, withIntermediateDirectories: true)
         launchAtLogin = (SMAppService.mainApp.status == .enabled)
-        log("APP start (autoEnabled=\(autoEnabled) paused=\(paused)) — 5 分钟后首次拉取")
-        Task {   // 开机/程序启动后先等 5 分钟，再做首次拉取（避免开机瞬间抢跑）
-            try? await Task.sleep(nanoseconds: 300_000_000_000)
+        let needsBootstrap = windowEnd == nil
+        log("APP start (autoEnabled=\(autoEnabled) paused=\(paused) restoredWindowEnd=\(fmt(windowEnd))) — \(needsBootstrap ? "无窗口时间，立即拉取" : "5 分钟后首次拉取")")
+        Task {
+            // 有持久化时间时延续原来的 5 分钟启动缓冲；没有时间（菜单栏会显示“–”）则立即恢复状态。
+            if !needsBootstrap {
+                try? await Task.sleep(nanoseconds: 300_000_000_000)
+            }
             await refresh()
         }
         // 本地倒计时 + 到点判断；不再定时轮询接口（resets_at 在一个 5h 窗口内固定不变）
@@ -346,19 +363,52 @@ final class Store: ObservableObject {
         return r.code == 0
     }
 
+    // 查询失败后不能只依赖 maybeAct()：后者必须先有 windowEnd，正是菜单栏显示“–”时缺少的状态。
+    // 始终只保留一个延迟任务；手动刷新或新的刷新开始时会取消旧任务并重新计时。
+    func scheduleRefreshRetry(_ reason: String) {
+        guard !paused, refreshRetryTask == nil else { return }
+        let seconds = refreshRetryIntervalSec
+        log("REFRESH retry scheduled in \(Int(seconds))s: \(reason)")
+        refreshRetryTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            guard !Task.isCancelled, let self else { return }
+            self.refreshRetryTask = nil
+            await self.refresh()
+        }
+    }
+
+    func cancelRefreshRetry() {
+        refreshRetryTask?.cancel()
+        refreshRetryTask = nil
+    }
+
+    // 接口查询成功但没有活动 5h 窗口、且本地也没有可恢复的 windowEnd：
+    // 用一条 Haiku 消息激活窗口。lastAttempt/lastFire 防止接口数据传播延迟造成重复发送。
+    func maybeBootstrapMissingWindow() {
+        guard autoEnabled, !paused, windowEnd == nil, !busyFiring, !acting else { return }
+        let current = Date()
+        let mostRecent = [lastAttempt, lastFire].compactMap { $0 }.max()
+        if let recent = mostRecent, current.timeIntervalSince(recent) < retryIntervalSec { return }
+        log("BOOTSTRAP: usage 查询成功但 windowEnd=nil → 用 Haiku 发送 hi 激活 5 小时窗口")
+        Task { await fire() }
+    }
+
     func refresh() async {
+        cancelRefreshRetry()
         await readCodexUsage()          // Codex：本地读文件，不联网/不耗额度 → 不受暂停影响
         maybeActCodex()
         guard !paused else { return }   // 暂停：仅停止 Claude 的 GET 与续窗（不影响上面的 Codex）
         guard await proxyEnabled() else {   // 前置条件：代理未开则跳过用量刷新（Codex 已在上方读完）
             lastError = "代理未开启，已跳过用量刷新"
             log("REFRESH abort: 代理未开启")
+            scheduleRefreshRetry("代理未开启")
             return
         }
         let cred = await readCredential()
         guard let tok = cred.accessToken else {
             lastError = "无法读取 Keychain token（\(cred.diag)）"
             log("REFRESH abort: 无法读取 Keychain token — \(cred.diag)")
+            scheduleRefreshRetry("无法读取 Keychain token")
             return
         }
         let tokExp = tokenExpStr(cred.expiresAtMs)
@@ -377,6 +427,7 @@ final class Store: ObservableObject {
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 lastError = "usage HTTP \(http.statusCode)"
                 log("REFRESH http \(http.statusCode) tokenExp=\(tokExp) body=\(String(body.prefix(220)))")
+                scheduleRefreshRetry("usage HTTP \(http.statusCode)")
                 return
             }
             let u = try JSONDecoder().decode(UsageResponse.self, from: data)
@@ -395,12 +446,18 @@ final class Store: ObservableObject {
             if hasActiveWindow { windowEnd = fiveReset }
             // 关键诊断日志：原始 resets_at / 用量 / is_active 全记下——下次窗口过期时这行会揭示接口的真实返回
             log("REFRESH ok five=\(pctStr(fivePct)) rawReset=\(fmt(fiveReset)) tokenExp=\(tokExp) sessionActive=\(boolStr(sessionActive)) → windowEnd=\(fmt(windowEnd)) (active=\(hasActiveWindow))")
+            if windowEnd == nil, autoEnabled {
+                // 服务端已明确当前没有活动窗口。立即尝试激活，并持续重查直到拿到新 reset。
+                scheduleRefreshRetry("查询成功但 five_hour.resets_at=nil")
+                maybeBootstrapMissingWindow()
+            }
         } catch {
             // 带上 NSError 的 domain#code：区分连接中断(-1005)/超时(-1001)/离线(-1009)/SSL(-1200) 等，
             // 对代理不稳的场景特别有用——localizedDescription 三种都可能是「网络连接已丢失」。
             let ns = error as NSError
             lastError = "查询失败: \(error.localizedDescription)"
             log("REFRESH failed: \(ns.domain)#\(ns.code) \(error.localizedDescription)")
+            scheduleRefreshRetry("\(ns.domain)#\(ns.code)")
         }
     }
 
@@ -606,7 +663,11 @@ final class Store: ObservableObject {
     func togglePause() {
         paused.toggle()
         log(paused ? "PAUSED（停止 GET 与续窗）" : "RESUMED（恢复监控）")
-        if !paused { refreshNow() }
+        if paused {
+            cancelRefreshRetry()
+        } else {
+            refreshNow()
+        }
     }
 
     // 开机自启：注册/注销登录项；首次开启时跳转「系统设置▸登录项」让用户确认
