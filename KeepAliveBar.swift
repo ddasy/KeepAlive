@@ -122,6 +122,9 @@ enum Shell {
 // MARK: - 状态与调度
 @MainActor
 final class Store: ObservableObject {
+    // 单例：SwiftUI 场景与 AppDelegate（悬停快照）共用同一份状态
+    static let shared = Store()
+
     @Published var fivePct: Double?
     @Published var fiveReset: Date?       // 接口原始 five_hour.resets_at（窗口过期后可能为 null → nil）
     // windowEnd：我们信任并倒计时的“当前 5h 窗口结束时刻”。只要服务端返回未来的 five_hour.resets_at
@@ -169,6 +172,10 @@ final class Store: ObservableObject {
     @Published var autoQueryOnOpen: Bool {                        // 打开菜单栏弹窗时是否自动查询一次用量
         didSet { UserDefaults.standard.set(autoQueryOnOpen, forKey: "autoQueryOnOpen") }
     }
+    @Published var hideCountdown: Bool {                          // 隐藏倒计时：菜单栏只留图标，不显示 Claude 下次重置剩余时间
+        didSet { UserDefaults.standard.set(hideCountdown, forKey: "hideCountdown") }
+    }
+    @Published var popupOpen = false                              // 主弹窗是否正开着（悬停快照据此避让，见 HoverSnapshot）
 
     let bufferSec: TimeInterval = 90        // 真实重置时刻之后再等这么久才发（确保旧窗口确已关闭）
     let retryIntervalSec: TimeInterval = 180 // 两次“尝试”最小间隔：失败/未续窗时按此退避重试（3 分钟）
@@ -197,6 +204,7 @@ final class Store: ObservableObject {
         self.autoEnabled = (UserDefaults.standard.object(forKey: "autoEnabled") as? Bool) ?? true
         self.paused = UserDefaults.standard.bool(forKey: "paused")   // 默认 false
         self.autoQueryOnOpen = (UserDefaults.standard.object(forKey: "autoQueryOnOpen") as? Bool) ?? true
+        self.hideCountdown = UserDefaults.standard.bool(forKey: "hideCountdown")   // 默认 false（显示倒计时）
         if let t = UserDefaults.standard.object(forKey: "windowEnd") as? Double {
             self.windowEnd = Date(timeIntervalSince1970: t)
         }
@@ -251,8 +259,11 @@ final class Store: ObservableObject {
     }
 
     // 菜单栏标题：仅显示距 5h 窗口重置的剩余时间（图标已是 Clawd，去掉闪电标识）
+    // 返回 "" 表示“菜单栏只留图标”（隐藏倒计时）；暂停态仍保留 ⏸——它是运行状态而非刷新时间，
+    // 否则关掉保活后菜单栏毫无痕迹，容易忘了自己按过暂停。
     var menuTitle: String {
         if paused { return "⏸" }
+        if hideCountdown { return "" }                  // 隐藏倒计时
         guard let end = windowEnd else { return "–" }   // 还没见过任何活动窗口
         let rem = end.timeIntervalSince(now)
         return rem <= 0 ? "now" : Store.hhmm(rem)       // 已过末尾 → "now"（等待续窗）
@@ -715,6 +726,24 @@ func sevColor(_ pct: Double?) -> Color {
 func localHM(_ d: Date) -> String { let f = DateFormatter(); f.dateFormat = "HH:mm"; return f.string(from: d) }
 func localMDHM(_ d: Date) -> String { let f = DateFormatter(); f.dateFormat = "MM-dd HH:mm"; return f.string(from: d) }
 func localMonthDayHM(_ d: Date) -> String { let f = DateFormatter(); f.dateFormat = "M月d日 HH:mm"; return f.string(from: d) }
+// 用量条。刻意不用 ProgressView：它在 macOS 上是 NSProgressIndicator 包出来的 AppKit 控件，
+// 颜色跟着**窗口的 key/active 状态**走——悬停快照那个面板故意不抢焦点、永远不是 key 窗口，
+// 于是 .tint 会被系统灰掉，和点开的弹窗对不上。纯 SwiftUI 图形没有这个包袱，两处渲染完全一致。
+struct UsageBar: View {
+    let value: Double        // 0…1
+    let color: Color
+    var body: some View {
+        GeometryReader { g in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.primary.opacity(0.14))
+                Capsule().fill(color)
+                    .frame(width: max(0, min(1, value)) * g.size.width)
+            }
+        }
+        .frame(height: 6)
+    }
+}
+
 func resetInfo(_ reset: Date?, _ now: Date) -> String {
     guard let r = reset else { return "重置 —" }
     let rem = r.timeIntervalSince(now)
@@ -723,18 +752,15 @@ func resetInfo(_ reset: Date?, _ now: Date) -> String {
 }
 
 // MARK: - 弹窗界面
-struct ContentView: View {
+// 弹窗被拆成两块，方便悬停快照直接复用上半部分：
+//   · UsageSections —— Claude / Codex 用量。纯展示，无任何副作用（不查询、不写状态）。
+//   · ControlSections —— 开关、按钮、上次保活结果等“操作与诊断”。
+// 主弹窗 = UsageSections + ControlSections；悬停快照 = UsageSections（见 SnapshotView）。
+// 两者共用同一份渲染代码，改一处两边同步，绝不会出现“快照和弹窗对不上”。
+struct UsageSections: View {
     @EnvironmentObject var s: Store
 
     var maxPct: Double { max(s.fivePct ?? 0, s.sevenPct ?? 0) }
-
-    var nextFireText: String {
-        if s.paused { return "已暂停（点“恢复”继续监控与续窗）" }
-        if !s.autoEnabled { return "自动保活已关闭" }
-        guard let end = s.windowEnd else { return "下次保活：等待用量数据…" }
-        let rem = end.timeIntervalSince(s.now)
-        return rem > 0 ? "下次保活：约 \(Store.hhmm(rem)) 后" : "下次保活：即将执行"
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -759,8 +785,62 @@ struct ContentView: View {
             }
             codexRow("5 小时", s.codexPrimaryUsed, s.codexPrimaryReset, withDate: false)
             codexRow("周限", s.codexWeeklyUsed, s.codexWeeklyReset, withDate: true)
+        }
+    }
 
-            Divider()
+    @ViewBuilder
+    func usageRow(_ title: String, _ pct: Double?, _ reset: Date?) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(title).font(.subheadline).bold()
+                Spacer()
+                Text(pct == nil ? "—" : "\(Int(pct!.rounded()))%")
+                    .font(.subheadline).foregroundStyle(sevColor(pct))
+            }
+            UsageBar(value: (pct ?? 0) / 100, color: sevColor(pct))
+            Text(resetInfo(reset, s.now)).font(.caption2).foregroundStyle(.secondary)
+        }
+    }
+
+    // Codex 行：剩余百分比 + 重置时间（withDate=true 时带日期，如 7月8日 04:59）
+    @ViewBuilder
+    func codexRow(_ title: String, _ used: Double?, _ reset: Date?, withDate: Bool) -> some View {
+        let rolledOff = reset.map { $0 <= s.now } ?? false
+        let usedNow = rolledOff ? 0 : (used ?? 0)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(title).font(.subheadline).bold()
+                Spacer()
+                Text(used == nil ? "—" : "剩余 \(Int((100 - usedNow).rounded()))%")
+                    .font(.subheadline).foregroundStyle(sevColor(usedNow))
+            }
+            UsageBar(value: usedNow / 100, color: sevColor(usedNow))
+            if rolledOff {
+                Text("已重置（快照过期，无实时数据）").font(.caption2).foregroundStyle(.secondary)
+            } else if let r = reset {
+                Text(withDate ? "重置时间 \(localMonthDayHM(r))" : "重置 \(localHM(r))")
+                    .font(.caption2).foregroundStyle(.secondary)
+            } else {
+                Text("暂无快照").font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+// 下半部分：开关、按钮、上次保活结果 —— 只出现在点击弹窗里，悬停快照不含这些
+struct ControlSections: View {
+    @EnvironmentObject var s: Store
+
+    var nextFireText: String {
+        if s.paused { return "已暂停（点“恢复”继续监控与续窗）" }
+        if !s.autoEnabled { return "自动保活已关闭" }
+        guard let end = s.windowEnd else { return "下次保活：等待用量数据…" }
+        let rem = end.timeIntervalSince(s.now)
+        return rem > 0 ? "下次保活：约 \(Store.hhmm(rem)) 后" : "下次保活：即将执行"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
             Text(nextFireText).font(.caption).foregroundStyle(.secondary)
             HStack {
                 Text("自动保活").font(.caption)
@@ -779,6 +859,11 @@ struct ContentView: View {
                 Text("自动查询").font(.caption)
                 Spacer()
                 Toggle("", isOn: $s.autoQueryOnOpen).toggleStyle(.switch).labelsHidden()
+            }
+            HStack {
+                Text("隐藏倒计时").font(.caption)
+                Spacer()
+                Toggle("", isOn: $s.hideCountdown).toggleStyle(.switch).labelsHidden()
             }
 
             HStack(spacing: 8) {
@@ -807,54 +892,199 @@ struct ContentView: View {
                 Text(e).font(.caption2).foregroundStyle(.red).lineLimit(2)
             }
         }
+    }
+}
+
+// 点击菜单栏图标弹出的主界面
+struct ContentView: View {
+    @EnvironmentObject var s: Store
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            UsageSections()
+            Divider()
+            ControlSections()
+        }
         .padding(14)
         .frame(width: 300)
-        .onAppear { if s.autoQueryOnOpen { s.refreshNow() } }   // 打开弹窗时按开关决定是否自动查询用量
+        .onAppear {
+            s.popupOpen = true
+            if s.autoQueryOnOpen { s.refreshNow() }   // 打开弹窗时按开关决定是否自动查询用量
+        }
+        .onDisappear { s.popupOpen = false }
+    }
+}
+
+// 悬停快照：鼠标在菜单栏图标上停 1.5 秒弹出，**不发任何请求**——只把当前内存里的数据画出来。
+// 想要最新数值仍然点开弹窗（受“自动查询”开关控制）。底部一行标明数据新鲜度，避免把旧快照当实时值。
+// 卡片的毛玻璃背景由 NSVisualEffectView 提供（见 HoverSnapshot.makePanel），这里只画内容，
+// 不加 .background —— SwiftUI 的 .regularMaterial 在 NSHostingView 里是“窗口内混合”，
+// 窗口背后是空的，糊出来就是一块不透明色块，和弹窗的观感对不上。
+struct SnapshotView: View {
+    @EnvironmentObject var s: Store
+
+    var freshness: String {
+        if s.paused { return "已暂停 · 快照" }
+        guard let r = s.lastRefresh else { return "暂无数据 · 快照" }
+        return "数据截至 \(localHM(r)) · 快照"
     }
 
-    @ViewBuilder
-    func usageRow(_ title: String, _ pct: Double?, _ reset: Date?) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text(title).font(.subheadline).bold()
-                Spacer()
-                Text(pct == nil ? "—" : "\(Int(pct!.rounded()))%")
-                    .font(.subheadline).foregroundStyle(sevColor(pct))
-            }
-            ProgressView(value: min(max((pct ?? 0) / 100, 0), 1)).tint(sevColor(pct))
-            Text(resetInfo(reset, s.now)).font(.caption2).foregroundStyle(.secondary)
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            UsageSections()
+            Text(freshness).font(.caption2).foregroundStyle(.secondary)
+        }
+        .padding(14)
+        .frame(width: 300)
+    }
+}
+
+// MARK: - 悬停快照的 AppKit 承载
+// MenuBarExtra 不暴露它的 NSStatusItem，所以“图标上悬停”只能自己在 AppKit 侧实现：
+//   · 定位状态项按钮：在 NSApp.windows 里找 NSStatusBarButton（状态栏窗口属于本 App）。
+//   · 判定悬停：每 0.25s 比一次 NSEvent.mouseLocation 与按钮屏幕矩形。
+//     刻意不用全局事件监听——鼠标移动的全局监听在后台 App 上并不可靠，而 mouseLocation
+//     是廉价同步调用，对 1.5 秒的停留判定精度绰绰有余。
+//   · 展示：无边框、不激活、不吃鼠标事件的浮动面板，钉在图标正下方。
+@MainActor
+final class HoverSnapshot {
+    static let shared = HoverSnapshot()
+
+    private let dwell: TimeInterval = 1.5        // 悬停多久才弹
+    private let pollInterval: TimeInterval = 0.25
+
+    private var store: Store?
+    private var timer: Timer?
+    private var panel: NSPanel?
+    private var host: NSView?            // 快照内容的 NSHostingView（只用到 fittingSize / 布局）
+    private var statusButton: NSStatusBarButton?
+    private var hoverSince: Date?
+    private var loggedButton = false
+
+    func start(store: Store) {
+        guard timer == nil else { return }
+        self.store = store
+        timer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.poll() }
         }
     }
 
-    // Codex 行：剩余百分比 + 重置时间（withDate=true 时带日期，如 7月8日 04:59）
-    @ViewBuilder
-    func codexRow(_ title: String, _ used: Double?, _ reset: Date?, withDate: Bool) -> some View {
-        let rolledOff = reset.map { $0 <= s.now } ?? false
-        let usedNow = rolledOff ? 0 : (used ?? 0)
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text(title).font(.subheadline).bold()
-                Spacer()
-                Text(used == nil ? "—" : "剩余 \(Int((100 - usedNow).rounded()))%")
-                    .font(.subheadline).foregroundStyle(sevColor(usedNow))
-            }
-            ProgressView(value: min(max(usedNow / 100, 0), 1)).tint(sevColor(usedNow))
-            if rolledOff {
-                Text("已重置（快照过期，无实时数据）").font(.caption2).foregroundStyle(.secondary)
-            } else if let r = reset {
-                Text(withDate ? "重置时间 \(localMonthDayHM(r))" : "重置 \(localHM(r))")
-                    .font(.caption2).foregroundStyle(.secondary)
-            } else {
-                Text("暂无快照").font(.caption2).foregroundStyle(.secondary)
-            }
+    private func poll() {
+        guard let store else { return }
+        // 主弹窗开着时不抢戏；状态项还没建好（启动瞬间）也直接跳过，下一轮再找
+        guard !store.popupOpen, let frame = buttonFrame() else { reset(); return }
+        guard frame.insetBy(dx: -1, dy: -1).contains(NSEvent.mouseLocation) else { reset(); return }
+        if hoverSince == nil { hoverSince = Date() }
+        if Date().timeIntervalSince(hoverSince!) >= dwell { show(under: frame) }
+    }
+
+    private func reset() {
+        hoverSince = nil
+        if panel?.isVisible == true { panel?.orderOut(nil) }
+    }
+
+    // 状态项按钮的屏幕矩形。按钮宽度会随标题变化（隐藏倒计时后只剩图标），所以每次都重算。
+    private func buttonFrame() -> NSRect? {
+        if statusButton?.window == nil { statusButton = HoverSnapshot.findStatusButton() }
+        guard let b = statusButton, let w = b.window, b.bounds.width > 0 else { return nil }
+        let f = w.convertToScreen(b.convert(b.bounds, to: nil))
+        if !loggedButton {   // 每次启动记一行：这套定位依赖 MenuBarExtra 的私有视图层级，将来失效时一眼可见
+            loggedButton = true
+            store?.log("HOVER: 已定位状态项按钮 frame=\(NSStringFromRect(f))")
         }
+        return f
+    }
+
+    private static func findStatusButton() -> NSStatusBarButton? {
+        for w in NSApp.windows {
+            if let b = firstStatusBarButton(w.contentView) { return b }
+        }
+        return nil
+    }
+
+    private static func firstStatusBarButton(_ v: NSView?) -> NSStatusBarButton? {
+        guard let v else { return nil }
+        if let b = v as? NSStatusBarButton { return b }
+        for sub in v.subviews {
+            if let b = firstStatusBarButton(sub) { return b }
+        }
+        return nil
+    }
+
+    private func show(under frame: NSRect) {
+        if panel == nil { makePanel() }
+        guard let panel, let host else { return }
+        // 内容高度会随数据变化（Opus/Sonnet 行可能后来才出现），所以每轮都按当前内容重算尺寸与位置
+        host.layoutSubtreeIfNeeded()
+        let size = host.fittingSize
+        if panel.frame.size != size { panel.setContentSize(size) }
+        var x = frame.midX - size.width / 2
+        if let vf = (statusButton?.window?.screen ?? NSScreen.main)?.visibleFrame {
+            x = min(max(x, vf.minX + 8), max(vf.minX + 8, vf.maxX - size.width - 8))
+        }
+        panel.setFrameOrigin(NSPoint(x: x, y: frame.minY - size.height - 6))
+        if !panel.isVisible { panel.orderFrontRegardless() }   // 不激活本 App，不抢焦点
+    }
+
+    private func makePanel() {
+        guard let store else { return }
+        // controlActiveState 强制为 .active：面板刻意不抢焦点，SwiftUI 便会按“非活动窗口”渲染，
+        // 进度条的 .tint 会被灰掉。指定活动态后，快照里的进度条颜色与点开弹窗时完全一致。
+        let view = NSHostingView(rootView: SnapshotView()
+            .environmentObject(store)
+            .environment(\.controlActiveState, .active))
+        view.translatesAutoresizingMaskIntoConstraints = false
+
+        // 卡片背景用 NSVisualEffectView 的 .behindWindow 混合 —— 这是弹窗那种“透出桌面”的
+        // 毛玻璃唯一的来源；SwiftUI 的 Material 在无背景的浮动窗口里只会糊成一块实色。
+        let fx = NSVisualEffectView()
+        fx.material = .menu                 // 与菜单栏弹窗同款的系统菜单材质
+        fx.blendingMode = .behindWindow
+        fx.state = .active                  // 本 App 不激活也保持模糊，不随焦点变灰
+        fx.wantsLayer = true
+        fx.layer?.cornerRadius = 12
+        fx.layer?.cornerCurve = .continuous
+        fx.layer?.masksToBounds = true
+        fx.layer?.borderWidth = 1
+        fx.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.35).cgColor
+        fx.addSubview(view)
+        NSLayoutConstraint.activate([
+            view.leadingAnchor.constraint(equalTo: fx.leadingAnchor),
+            view.trailingAnchor.constraint(equalTo: fx.trailingAnchor),
+            view.topAnchor.constraint(equalTo: fx.topAnchor),
+            view.bottomAnchor.constraint(equalTo: fx.bottomAnchor)
+        ])
+
+        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 300, height: 200),
+                        styleMask: [.borderless, .nonactivatingPanel],
+                        backing: .buffered, defer: false)
+        p.contentView = fx
+        p.isFloatingPanel = true
+        p.level = .statusBar                 // 与菜单栏同级：盖住普通窗口，又不越过系统菜单
+        p.isOpaque = false
+        p.backgroundColor = .clear           // 窗口本身透明，圆角+毛玻璃由上面的 NSVisualEffectView 画
+        p.hasShadow = true
+        p.ignoresMouseEvents = true          // 纯展示：不吃点击，不影响再点图标
+        p.hidesOnDeactivate = false
+        p.animationBehavior = .utilityWindow
+        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        panel = p
+        host = view
+    }
+}
+
+// AppDelegate 只负责一件事：启动后开始监视菜单栏图标上的悬停
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        MainActor.assumeIsolated { HoverSnapshot.shared.start(store: Store.shared) }
     }
 }
 
 // MARK: - App 入口（菜单栏）
 @main
 struct KeepAliveBarApp: App {
-    @StateObject private var store = Store()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @StateObject private var store = Store.shared
 
     // Clawd 像素蟹图标（保留彩色，不做模板染色）
     static let clawd: NSImage? = {
@@ -873,9 +1103,11 @@ struct KeepAliveBarApp: App {
         } label: {
             if let img = KeepAliveBarApp.clawd {
                 Image(nsImage: img)
-                Text(store.menuTitle)
+                // menuTitle 为空 = 隐藏倒计时：整段 Text 都不放，避免留下一块空白间距
+                if !store.menuTitle.isEmpty { Text(store.menuTitle) }
             } else {
-                Text(store.menuTitle)
+                // 没有图标资源时兜底：标题不能为空，否则状态项宽度为 0 就点不到了
+                Text(store.menuTitle.isEmpty ? "◷" : store.menuTitle)
             }
         }
         .menuBarExtraStyle(.window)

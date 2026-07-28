@@ -35,8 +35,8 @@ anthropic-beta: oauth-2025-04-20
 | 文件 | 作用 |
 |---|---|
 | `KeepAliveBar.swift` | 菜单栏 App 源码（SwiftUI `MenuBarExtra`，同时自动激活 Claude/Codex） |
-| `build-app.sh` | 编译并打包成 `KeepAliveBar.app`（菜单栏 Agent，无 Dock 图标） |
-| `install-app.sh` | 可选：装到 `/Applications` + 设开机自启 |
+| `build-app.sh` | 编译 → 临时目录组包 → 整包替换 `/Applications/KeepAliveBar.app` 并重启（磁盘上只留这一份） |
+| `install-app.sh` | `build-app.sh` + 保活专用 `keepalive-claude` 固定副本 + 开机自启登录项（自动去重） |
 | `null/` | 保活消息从这个空目录发起（避免读入任何上下文） |
 | `keepalive.sh` | launchd 版核心：查 Claude usage / Codex 快照 → 判断 → 必要时发保活 |
 | `status.sh` | **只读**面板：打印 Claude/Codex 用量、重置时间和自动激活状态。随时可跑，不发消息 |
@@ -49,15 +49,33 @@ App 的日志/空目录在 `~/Library/Application Support/KeepAliveBar/`。
 ## A · 菜单栏 App（推荐）
 
 ```bash
-bash build-app.sh                 # 编译 → KeepAliveBar.app
-open KeepAliveBar.app             # 启动，菜单栏出现 ⚡︎ 图标
-# 满意后：装到 /Applications 并开机自启（可选）
-bash install-app.sh
+bash build-app.sh                 # 编译 → 直接装进 /Applications 并重启，菜单栏出现 Clawd 图标
+bash install-app.sh               # 再加：开机自启登录项 + keepalive-claude 固定副本
 ```
+
+**只会有一份 App**：`build-app.sh` 在临时目录里组包，编译签名都成功后才整包替换
+`/Applications/KeepAliveBar.app`（编译失败不会碰你正在用的那份），项目目录里不再留 `.app`
+副本——否则聚焦搜索会并排列出两个同名 App，误点项目里那份就会跑出第二个实例
+（两个都保活、共用同一份 UserDefaults 和日志）。想编译到别处试跑：
+`KA_DEST=/tmp/ka/KeepAliveBar.app bash build-app.sh`。
 
 菜单栏图标显示 Claude 距 5h 窗口重置的倒计时；点击弹窗有 Claude/Codex 的 5h/周用量、
 重置时间、`自动保活`开关、`开机自启`开关、`刷新` / `退出`。开着它、`自动保活`打开，
 Claude 窗口一关会自动续窗；Codex 在已有 reset 快照时到期续窗，没有快照时连续 5 小时后发送 `hi`。
+
+**弹窗结构**：分成「用量」（Claude + Codex，纯展示、无副作用）与「操作」（开关/按钮/上次保活结果）
+两部分——悬停快照直接复用前者，两处永远同一份渲染代码。
+
+| 开关 | 作用 |
+|---|---|
+| `自动保活` | 窗口关闭后是否自动发保活消息续窗 |
+| `开机自启` | 注册登录项（`SMAppService`） |
+| `自动查询` | 点开弹窗时是否自动查一次用量 |
+| `隐藏倒计时` | 菜单栏只留 Clawd 图标，不显示 Claude 下次重置的剩余时间（暂停时仍显示 `⏸`，否则会忘了自己按过暂停） |
+
+**悬停快照**：鼠标停在菜单栏图标上 **1.5 秒**，图标正下方浮出一张只读快照（Claude + Codex 两块用量），
+**不发任何请求**——只画当前内存里的数据，底部一行标明数据截至时刻；鼠标移开即消失，也不吃点击。
+配合`隐藏倒计时`用最省心：菜单栏干干净净，想看一眼就停一下鼠标，要最新数值再点开弹窗。
 
 **开机自启**：勾选后用 `SMAppService` 注册登录项并跳转「系统设置 ▸ 通用 ▸ 登录项」让你确认
 （普通 App 登录项其实是**秒开、无需密码**）。登录项绑定 App 当前所在路径，所以**建议先
