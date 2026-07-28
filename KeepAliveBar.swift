@@ -915,7 +915,7 @@ struct ContentView: View {
     }
 }
 
-// 悬停快照：鼠标在菜单栏图标上停 1.5 秒弹出，**不发任何请求**——只把当前内存里的数据画出来。
+// 悬停快照：鼠标在菜单栏图标上停 0.8 秒弹出，**不发任何请求**——只把当前内存里的数据画出来。
 // 想要最新数值仍然点开弹窗（受“自动查询”开关控制）。底部一行标明数据新鲜度，避免把旧快照当实时值。
 // 卡片的毛玻璃背景由 NSVisualEffectView 提供（见 HoverSnapshot.makePanel），这里只画内容，
 // 不加 .background —— SwiftUI 的 .regularMaterial 在 NSHostingView 里是“窗口内混合”，
@@ -944,14 +944,14 @@ struct SnapshotView: View {
 //   · 定位状态项按钮：在 NSApp.windows 里找 NSStatusBarButton（状态栏窗口属于本 App）。
 //   · 判定悬停：每 0.25s 比一次 NSEvent.mouseLocation 与按钮屏幕矩形。
 //     刻意不用全局事件监听——鼠标移动的全局监听在后台 App 上并不可靠，而 mouseLocation
-//     是廉价同步调用，对 1.5 秒的停留判定精度绰绰有余。
+//     是廉价同步调用，0.1s 一次的轮询对 0.8 秒的停留判定绰绰有余。
 //   · 展示：无边框、不激活、不吃鼠标事件的浮动面板，钉在图标正下方。
 @MainActor
 final class HoverSnapshot {
     static let shared = HoverSnapshot()
 
-    private let dwell: TimeInterval = 1.5        // 悬停多久才弹
-    private let pollInterval: TimeInterval = 0.25
+    private let dwell: TimeInterval = 0.8        // 悬停多久才弹
+    private let pollInterval: TimeInterval = 0.1 // 判定粒度：必须远小于 dwell，否则 0.8s 会拖成 1s 才弹
 
     private var store: Store?
     private var timer: Timer?
@@ -988,8 +988,10 @@ final class HoverSnapshot {
         if statusButton?.window == nil { statusButton = HoverSnapshot.findStatusButton() }
         guard let b = statusButton, let w = b.window, b.bounds.width > 0 else { return nil }
         let f = w.convertToScreen(b.convert(b.bounds, to: nil))
-        if !loggedButton {   // 每次启动记一行：这套定位依赖 MenuBarExtra 的私有视图层级，将来失效时一眼可见
-            loggedButton = true
+        // 启动后头几十毫秒状态项还没被系统摆到菜单栏（frame 在屏幕外，如 {0,-26}），
+        // 等它落到某块屏幕上再记这一行——否则日志记的是个没用的临时值。
+        if !loggedButton, NSScreen.screens.contains(where: { $0.frame.intersects(f) }) {
+            loggedButton = true   // 每次启动记一行：定位依赖 MenuBarExtra 的私有视图层级，将来失效时一眼可见
             store?.log("HOVER: 已定位状态项按钮 frame=\(NSStringFromRect(f))")
         }
         return f
