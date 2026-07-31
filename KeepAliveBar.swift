@@ -162,8 +162,12 @@ final class Store: ObservableObject {
     @Published var lastFireResult: String = ""
     @Published var busyFiring = false
     @Published var now: Date = Date()
-    @Published var autoEnabled: Bool {
-        didSet { UserDefaults.standard.set(autoEnabled, forKey: "autoEnabled") }
+    // 保活开关拆成两路：Claude / Codex 各自独立，互不影响（旧版单一 autoEnabled 键在 init 里迁移）
+    @Published var claudeAutoEnabled: Bool {
+        didSet { UserDefaults.standard.set(claudeAutoEnabled, forKey: "claudeAutoEnabled") }
+    }
+    @Published var codexAutoEnabled: Bool {
+        didSet { UserDefaults.standard.set(codexAutoEnabled, forKey: "codexAutoEnabled") }
     }
     @Published var launchAtLogin: Bool = false
     @Published var paused: Bool {                                 // 暂停：停止 GET 与续窗
@@ -187,6 +191,8 @@ final class Store: ObservableObject {
     private var lastAttempt: Date?          // 上次尝试时间（成功/失败都记）
     private var codexLastAttempt: Date?
     private var codexNoSnapshotSince: Date?
+    private var weeklyBlockLoggedAt: Date?  // Codex 周限拦截日志的节流时刻（每小时最多一条）
+    private var claudeWeeklyRecheckAt: Date? // Claude 周限满时的下次联网复查时刻（稀疏复查，不再 3 分钟一轮）
     private var lastCodexPoll: Date?
     private var codexActing = false
     private var refreshRetryTask: Task<Void, Never>?
@@ -201,7 +207,10 @@ final class Store: ObservableObject {
     var workdir: String { "\(supportDir)/null" }
 
     init() {
-        self.autoEnabled = (UserDefaults.standard.object(forKey: "autoEnabled") as? Bool) ?? true
+        // 迁移：旧版只有一个 autoEnabled，拆分后它作为两路开关的默认值（都没写过新键时）
+        let legacyAuto = (UserDefaults.standard.object(forKey: "autoEnabled") as? Bool) ?? true
+        self.claudeAutoEnabled = (UserDefaults.standard.object(forKey: "claudeAutoEnabled") as? Bool) ?? legacyAuto
+        self.codexAutoEnabled = (UserDefaults.standard.object(forKey: "codexAutoEnabled") as? Bool) ?? legacyAuto
         self.paused = UserDefaults.standard.bool(forKey: "paused")   // 默认 false
         self.autoQueryOnOpen = (UserDefaults.standard.object(forKey: "autoQueryOnOpen") as? Bool) ?? true
         self.hideCountdown = UserDefaults.standard.bool(forKey: "hideCountdown")   // 默认 false（显示倒计时）
@@ -223,7 +232,7 @@ final class Store: ObservableObject {
         try? FileManager.default.createDirectory(atPath: workdir, withIntermediateDirectories: true)
         launchAtLogin = (SMAppService.mainApp.status == .enabled)
         let needsBootstrap = windowEnd == nil
-        log("APP start (autoEnabled=\(autoEnabled) paused=\(paused) restoredWindowEnd=\(fmt(windowEnd))) — \(needsBootstrap ? "无窗口时间，立即拉取" : "5 分钟后首次拉取")")
+        log("APP start (claudeAuto=\(claudeAutoEnabled) codexAuto=\(codexAutoEnabled) paused=\(paused) restoredWindowEnd=\(fmt(windowEnd))) — \(needsBootstrap ? "无窗口时间，立即拉取" : "5 分钟后首次拉取")")
         Task {
             // 有持久化时间时延续原来的 5 分钟启动缓冲；没有时间（菜单栏会显示“–”）则立即恢复状态。
             if !needsBootstrap {
@@ -253,8 +262,8 @@ final class Store: ObservableObject {
         log("WARMUP: 首次启动 → 主动各跑一次 claude/codex，触发系统授权（钥匙串/文件访问），请在弹框点“始终允许”")
         Task { [weak self] in
             guard let self else { return }
-            await self.fire()        // 触发 claude 读/写钥匙串 → 首次弹“始终允许”
-            await self.fireCodex()   // 首次跑一次 codex，确认登录态/授权可用
+            if self.claudeAutoEnabled { await self.fire() }        // 触发 claude 读/写钥匙串 → 首次弹“始终允许”
+            if self.codexAutoEnabled { await self.fireCodex() }    // 首次跑一次 codex，确认登录态/授权可用
         }
     }
 
@@ -393,10 +402,28 @@ final class Store: ObservableObject {
         refreshRetryTask = nil
     }
 
+    // MARK: 周限闸门
+    // 周用量已 100%（Codex 侧即“剩余 0”）时，5h 窗口再怎么续也发不出消息 —— 直接不触发自动保活，
+    // 免得每 3 分钟撞一次墙、白白刷错误日志。
+    // 恢复条件：越过周重置时刻即解除。此后 Claude 会在下一次 refresh 拿到真实的新周用量，
+    // Codex 的 rollout 快照同理（UI 的 rolledOff 判定用的也是这条规则），于是自然继续保活。
+    // reset 未知（nil）而用量已满 → 保守拦下，等到拿到 reset 再说。
+    nonisolated static func weeklyBlocked(_ pct: Double?, _ reset: Date?, _ now: Date) -> Bool {
+        guard let p = pct, p >= 100 else { return false }
+        guard let r = reset else { return true }
+        return r.timeIntervalSince(now) > 0
+    }
+    var claudeWeeklyBlocked: Bool { Store.weeklyBlocked(sevenPct, sevenReset, now) }
+    var codexWeeklyBlocked: Bool { Store.weeklyBlocked(codexWeeklyUsed, codexWeeklyReset, now) }
+
     // 接口查询成功但没有活动 5h 窗口、且本地也没有可恢复的 windowEnd：
     // 用一条 Haiku 消息激活窗口。lastAttempt/lastFire 防止接口数据传播延迟造成重复发送。
     func maybeBootstrapMissingWindow() {
-        guard autoEnabled, !paused, windowEnd == nil, !busyFiring, !acting else { return }
+        guard claudeAutoEnabled, !paused, windowEnd == nil, !busyFiring, !acting else { return }
+        if claudeWeeklyBlocked {
+            log("BOOTSTRAP skip: Claude 周限 \(pctStr(sevenPct)) 已用尽（重置 \(fmt(sevenReset))）")
+            return
+        }
         let current = Date()
         let mostRecent = [lastAttempt, lastFire].compactMap { $0 }.max()
         if let recent = mostRecent, current.timeIntervalSince(recent) < retryIntervalSec { return }
@@ -457,7 +484,7 @@ final class Store: ObservableObject {
             if hasActiveWindow { windowEnd = fiveReset }
             // 关键诊断日志：原始 resets_at / 用量 / is_active 全记下——下次窗口过期时这行会揭示接口的真实返回
             log("REFRESH ok five=\(pctStr(fivePct)) rawReset=\(fmt(fiveReset)) tokenExp=\(tokExp) sessionActive=\(boolStr(sessionActive)) → windowEnd=\(fmt(windowEnd)) (active=\(hasActiveWindow))")
-            if windowEnd == nil, autoEnabled {
+            if windowEnd == nil, claudeAutoEnabled {
                 // 服务端已明确当前没有活动窗口。立即尝试激活，并持续重查直到拿到新 reset。
                 scheduleRefreshRetry("查询成功但 five_hour.resets_at=nil")
                 maybeBootstrapMissingWindow()
@@ -521,7 +548,15 @@ final class Store: ObservableObject {
     // Codex 没有公开 usage 查询接口：有本地 reset 就按 reset 续窗；没有时间时，
     // 首次观察开始计时，连续 5 小时后发送一次 hi 激活，随后等待新的 rollout 快照。
     func maybeActCodex() {
-        guard autoEnabled, !paused, !busyFiring, !acting, !codexActing else { return }
+        guard codexAutoEnabled, !paused, !busyFiring, !acting, !codexActing else { return }
+        // 周限剩余 0 → 本周不再触发 5h 保活，等越过周重置时刻自动恢复
+        if codexWeeklyBlocked {
+            if weeklyBlockLoggedAt == nil || Date().timeIntervalSince(weeklyBlockLoggedAt!) >= 3600 {
+                weeklyBlockLoggedAt = Date()   // 这行每小时最多记一条，别把日志刷满
+                log("CODEX skip: 周限剩余 0（重置 \(fmt(codexWeeklyReset))）→ 暂不保活")
+            }
+            return
+        }
         let current = Date()
         if let reset = codexPrimaryReset, reset.timeIntervalSince(current) > codexBufferSec {
             codexNoSnapshotSince = nil
@@ -603,11 +638,13 @@ final class Store: ObservableObject {
     // 用粘滞的 windowEnd 而非原始 fiveReset：即使接口在过期后把 resets_at 变 null / 未来，
     // windowEnd 仍指向旧窗口末尾（已过去）→ 能持续触发续窗与退避重试，不会像旧代码那样卡死。
     func maybeAct() {
-        guard autoEnabled, !busyFiring, !acting else { return }
+        guard claudeAutoEnabled, !busyFiring, !acting else { return }
         let now = Date()
         // 距上次“尝试”不足 retryIntervalSec 则不动（失败/未续窗时按此退避重试）
         if let la = lastAttempt, now.timeIntervalSince(la) < retryIntervalSec { return }
         guard let end = windowEnd else { return }   // 还没追踪任何活动窗口 → 不动
+        // 周限已满：不必每 3 分钟联网撞一次墙，按 claudeWeeklyRecheckAt 稀疏复查（见 handleWindowClosed）
+        if claudeWeeklyBlocked, let until = claudeWeeklyRecheckAt, now < until { return }
         if now.timeIntervalSince(end) >= bufferSec { // 本地倒计时已过窗口末尾 → 该确认并续窗
             log("maybeAct → handleWindowClosed (windowEnd=\(fmt(end)) 已过 \(Int(now.timeIntervalSince(end)))s)")
             Task { await handleWindowClosed() }
@@ -631,6 +668,15 @@ final class Store: ObservableObject {
         if let end = windowEnd, end.timeIntervalSince(Date()) > bufferSec {
             log("窗口已（重新）激活 windowEnd=\(fmt(end)) util=\(pctStr(fivePct)) → 跳过续窗")
             return                                     // 已有活动新窗口（用户已开 / 上次 fire 已成功）
+        }
+        // 刚拿到最新周用量：满了就不发（发也发不出去），并把下次复查推远，等周重置时刻附近再来。
+        if claudeWeeklyBlocked {
+            lastAttempt = Date()
+            let capped = min(Date().addingTimeInterval(1800),
+                             (sevenReset ?? .distantFuture).addingTimeInterval(60))
+            claudeWeeklyRecheckAt = max(capped, Date().addingTimeInterval(180))
+            log("WINDOW CLOSED 但 Claude 周限 \(pctStr(sevenPct))（重置 \(fmt(sevenReset))）→ 跳过续窗，\(fmt(claudeWeeklyRecheckAt)) 复查")
+            return
         }
         log("WINDOW CLOSED（windowEnd=\(fmt(windowEnd)) 最新 rawReset=\(fmt(fiveReset)) util=\(pctStr(fivePct))）→ fire")
         await fire()                                   // 旧窗口确已关闭且无新窗口 → 续窗
@@ -751,6 +797,14 @@ func resetInfo(_ reset: Date?, _ now: Date) -> String {
                     : "重置 \(localHM(r))（已过 \(Store.dhm(-rem))）"
 }
 
+// 周限专用：重置往往在好几天后，只给 HH:mm 根本看不出是哪天 → 带上月日，例：重置8月5日 13:22（剩余3d 9h 42m）
+func weeklyResetInfo(_ reset: Date?, _ now: Date) -> String {
+    guard let r = reset else { return "重置 —" }
+    let rem = r.timeIntervalSince(now)
+    return rem >= 0 ? "重置\(localMonthDayHM(r))（剩余\(Store.dhm(rem))）"
+                    : "重置\(localMonthDayHM(r))（已过\(Store.dhm(-rem))）"
+}
+
 // MARK: - 弹窗界面
 // 弹窗被拆成两块，方便悬停快照直接复用上半部分：
 //   · UsageSections —— Claude / Codex 用量。纯展示，无任何副作用（不查询、不写状态）。
@@ -771,9 +825,9 @@ struct UsageSections: View {
             }
 
             usageRow("5 小时会话", s.fivePct, s.fiveReset)
-            usageRow("周限", s.sevenPct, s.sevenReset)
-            if s.opusPct != nil { usageRow("周 · Opus", s.opusPct, s.opusReset) }
-            if s.sonnetPct != nil { usageRow("周 · Sonnet", s.sonnetPct, s.sonnetReset) }
+            usageRow("周限", s.sevenPct, s.sevenReset, weekly: true)
+            if s.opusPct != nil { usageRow("周 · Opus", s.opusPct, s.opusReset, weekly: true) }
+            if s.sonnetPct != nil { usageRow("周 · Sonnet", s.sonnetPct, s.sonnetReset, weekly: true) }
 
             Divider()
             HStack {
@@ -789,7 +843,7 @@ struct UsageSections: View {
     }
 
     @ViewBuilder
-    func usageRow(_ title: String, _ pct: Double?, _ reset: Date?) -> some View {
+    func usageRow(_ title: String, _ pct: Double?, _ reset: Date?, weekly: Bool = false) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Text(title).font(.subheadline).bold()
@@ -798,7 +852,8 @@ struct UsageSections: View {
                     .font(.subheadline).foregroundStyle(sevColor(pct))
             }
             UsageBar(value: (pct ?? 0) / 100, color: sevColor(pct))
-            Text(resetInfo(reset, s.now)).font(.caption2).foregroundStyle(.secondary)
+            Text(weekly ? weeklyResetInfo(reset, s.now) : resetInfo(reset, s.now))
+                .font(.caption2).foregroundStyle(.secondary)
         }
     }
 
@@ -818,7 +873,7 @@ struct UsageSections: View {
             if rolledOff {
                 Text("已重置（快照过期，无实时数据）").font(.caption2).foregroundStyle(.secondary)
             } else if let r = reset {
-                Text(withDate ? "重置时间 \(localMonthDayHM(r))" : "重置 \(localHM(r))")
+                Text(withDate ? weeklyResetInfo(r, s.now) : "重置 \(localHM(r))")
                     .font(.caption2).foregroundStyle(.secondary)
             } else {
                 Text("暂无快照").font(.caption2).foregroundStyle(.secondary)
@@ -831,21 +886,30 @@ struct UsageSections: View {
 struct ControlSections: View {
     @EnvironmentObject var s: Store
 
-    var nextFireText: String {
+    // 只在“被周限拦下”时给一行说明——否则用户会以为保活坏了。平时不占位。
+    var blockedText: String? {
         if s.paused { return "已暂停（点“恢复”继续监控与续窗）" }
-        if !s.autoEnabled { return "自动保活已关闭" }
-        guard let end = s.windowEnd else { return "下次保活：等待用量数据…" }
-        let rem = end.timeIntervalSince(s.now)
-        return rem > 0 ? "下次保活：约 \(Store.hhmm(rem)) 后" : "下次保活：即将执行"
+        var who: [String] = []
+        if s.claudeAutoEnabled, s.claudeWeeklyBlocked { who.append("Claude") }
+        if s.codexAutoEnabled, s.codexWeeklyBlocked { who.append("Codex") }
+        guard !who.isEmpty else { return nil }
+        return "\(who.joined(separator: " / ")) 周限已用尽，暂不保活（周重置后自动恢复）"
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text(nextFireText).font(.caption).foregroundStyle(.secondary)
+            if let t = blockedText {
+                Text(t).font(.caption).foregroundStyle(.secondary)
+            }
             HStack {
-                Text("自动保活").font(.caption)
+                Text("Claude 保活").font(.caption)
                 Spacer()
-                Toggle("", isOn: $s.autoEnabled).toggleStyle(.switch).labelsHidden()
+                Toggle("", isOn: $s.claudeAutoEnabled).toggleStyle(.switch).labelsHidden()
+            }
+            HStack {
+                Text("Codex 保活").font(.caption)
+                Spacer()
+                Toggle("", isOn: $s.codexAutoEnabled).toggleStyle(.switch).labelsHidden()
             }
             HStack {
                 Text("开机自启").font(.caption)
