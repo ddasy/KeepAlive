@@ -989,6 +989,100 @@ struct UsageSections: View {
     }
 }
 
+// 卡片式开关：不再使用系统滑轨。整张卡片/整行都是点击区域，开启时以轻量强调色和勾选标记反馈。
+// 仍然只修改传入的 Binding，具体副作用（例如 SMAppService）继续由 Binding 的 setter 负责。
+struct ToggleCheckmark: View {
+    let isOn: Bool
+    var compact = false
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(isOn ? Color.accentColor : Color.primary.opacity(0.055))
+            Circle()
+                .strokeBorder(isOn ? Color.accentColor : Color.secondary.opacity(0.28), lineWidth: 1)
+            if isOn {
+                Image(systemName: "checkmark")
+                    .font(.system(size: compact ? 8 : 9, weight: .bold))
+                    .foregroundStyle(.white)
+            }
+        }
+        .frame(width: compact ? 18 : 22, height: compact ? 18 : 22)
+    }
+}
+
+struct KeepAliveToggleCard: View {
+    let title: String
+    let mark: String
+    @Binding var isOn: Bool
+
+    var body: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.16)) { isOn.toggle() }
+        } label: {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .top) {
+                    Text(mark)
+                        .font(.caption2.weight(.semibold).monospaced())
+                        .foregroundStyle(isOn ? Color.white : Color.secondary)
+                        .frame(width: 28, height: 28)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(isOn ? Color.accentColor : Color.primary.opacity(0.075))
+                        )
+                    Spacer(minLength: 8)
+                    ToggleCheckmark(isOn: isOn)
+                }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).font(.caption.weight(.semibold))
+                    Text(isOn ? "正在保活" : "已关闭")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, minHeight: 96, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(isOn ? Color.accentColor.opacity(0.095) : Color.primary.opacity(0.035))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(isOn ? Color.accentColor.opacity(0.38) : Color.secondary.opacity(0.18), lineWidth: 1)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(title) 保活")
+        .accessibilityValue(isOn ? "已开启" : "已关闭")
+    }
+}
+
+struct SettingsToggleRow: View {
+    let title: String
+    @Binding var isOn: Bool
+
+    var body: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.16)) { isOn.toggle() }
+        } label: {
+            HStack(spacing: 10) {
+                Text(title).font(.caption)
+                Spacer()
+                ToggleCheckmark(isOn: isOn, compact: true)
+            }
+            .padding(.horizontal, 11)
+            .frame(height: 42)
+            .background(isOn ? Color.accentColor.opacity(0.055) : Color.clear)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
+        .accessibilityValue(isOn ? "已开启" : "已关闭")
+    }
+}
+
 // 下半部分：开关、按钮、上次保活结果 —— 只出现在点击弹窗里，悬停快照不含这些
 struct ControlSections: View {
     @EnvironmentObject var s: Store
@@ -1008,33 +1102,42 @@ struct ControlSections: View {
             if let t = blockedText {
                 Text(t).font(.caption).foregroundStyle(.secondary)
             }
-            HStack {
-                Text("Claude 保活").font(.caption)
-                Spacer()
-                Toggle("", isOn: $s.claudeAutoEnabled).toggleStyle(.switch).labelsHidden()
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("保活")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 4)
+                HStack(spacing: 8) {
+                    KeepAliveToggleCard(title: "Claude", mark: "C", isOn: $s.claudeAutoEnabled)
+                    KeepAliveToggleCard(title: "Codex", mark: ">_", isOn: $s.codexAutoEnabled)
+                }
             }
-            HStack {
-                Text("Codex 保活").font(.caption)
-                Spacer()
-                Toggle("", isOn: $s.codexAutoEnabled).toggleStyle(.switch).labelsHidden()
-            }
-            HStack {
-                Text("开机自启").font(.caption)
-                Spacer()
-                Toggle("", isOn: Binding(
-                    get: { s.launchAtLogin },
-                    set: { s.setLaunchAtLogin($0) }
-                )).toggleStyle(.switch).labelsHidden()
-            }
-            HStack {
-                Text("自动查询").font(.caption)
-                Spacer()
-                Toggle("", isOn: $s.autoQueryOnOpen).toggleStyle(.switch).labelsHidden()
-            }
-            HStack {
-                Text("隐藏倒计时").font(.caption)
-                Spacer()
-                Toggle("", isOn: $s.hideCountdown).toggleStyle(.switch).labelsHidden()
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("应用")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 4)
+                VStack(spacing: 0) {
+                    SettingsToggleRow(title: "开机自启", isOn: Binding(
+                        get: { s.launchAtLogin },
+                        set: { s.setLaunchAtLogin($0) }
+                    ))
+                    Divider().padding(.leading, 11)
+                    SettingsToggleRow(title: "自动查询", isOn: $s.autoQueryOnOpen)
+                    Divider().padding(.leading, 11)
+                    SettingsToggleRow(title: "隐藏倒计时", isOn: $s.hideCountdown)
+                }
+                .background(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(Color.primary.opacity(0.035))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(Color.secondary.opacity(0.18), lineWidth: 1)
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             }
 
             HStack(spacing: 8) {
