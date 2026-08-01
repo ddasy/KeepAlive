@@ -183,7 +183,9 @@ final class Store: ObservableObject {
 
     let bufferSec: TimeInterval = 90        // 真实重置时刻之后再等这么久才发（确保旧窗口确已关闭）
     let retryIntervalSec: TimeInterval = 180 // 两次“尝试”最小间隔：失败/未续窗时按此退避重试（3 分钟）
-    let refreshRetryIntervalSec: TimeInterval = 180 // 用量查询失败/缺少窗口时间时，3 分钟后自动重查
+    let refreshRetryIntervalSec: TimeInterval = 180 // 用量查询失败/缺少窗口时间时的退避基数（3 分钟起，指数增长）
+    let refreshRetryMaxIntervalSec: TimeInterval = 1800 // 退避上限 30 分钟
+    let tokenRefreshBufferSec: TimeInterval = 300 // token 剩余寿命少于 5 分钟就提前换，别卡在边界上发请求
     let codexBufferSec: TimeInterval = 90
     let codexRetryIntervalSec: TimeInterval = 180
     let codexFallbackSec: TimeInterval = 18000 // 没有 reset 快照时，连续 5 小时后首次激活
@@ -196,6 +198,8 @@ final class Store: ObservableObject {
     private var lastCodexPoll: Date?
     private var codexActing = false
     private var refreshRetryTask: Task<Void, Never>?
+    private var refreshRetryFailures = 0     // 连续失败次数 → scheduleRefreshRetry 的指数退避指数（成功即清零）
+    private var busyRefreshingToken = false  // token 刷新单飞：只防自己并发，不防 CLI（见 refreshOAuthToken 注释）
     let keychainService = "Claude Code-credentials"
     let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
 
@@ -337,7 +341,11 @@ final class Store: ObservableObject {
     // 读取 Keychain 凭据。返回 accessToken + 过期时刻(ms) + 失败诊断串（供日志精确定位）。
     // ⚠️ 绝不记录 token 本身；仅在失败时把 security 的退出码与错误输出（截断）带回来——
     //   security 成功时 out 是明文 token，只有 rc!=0 时 out 才是报错文本（item not found / auth denied 等）。
-    struct Credential { let accessToken: String?; let expiresAtMs: Double?; let diag: String }
+    // refreshToken / scopes 也读出来：过期时要拿它们走 CLI 的非交互刷新入口（见 refreshOAuthToken）。
+    struct Credential {
+        let accessToken: String?; let refreshToken: String?; let scopes: [String]
+        let expiresAtMs: Double?; let diag: String
+    }
     func readCredential() async -> Credential {
         let env = baseEnv(); let svc = keychainService
         let r = await Task.detached {
@@ -345,17 +353,21 @@ final class Store: ObservableObject {
         }.value
         guard r.code == 0 else {
             let msg = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
-            return Credential(accessToken: nil, expiresAtMs: nil,
+            return Credential(accessToken: nil, refreshToken: nil, scopes: [], expiresAtMs: nil,
                               diag: "security rc=\(r.code) \(String(msg.prefix(140)))")
         }
         guard let d = r.out.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else {
-            return Credential(accessToken: nil, expiresAtMs: nil, diag: "凭据 JSON 解析失败")
+            return Credential(accessToken: nil, refreshToken: nil, scopes: [], expiresAtMs: nil,
+                              diag: "凭据 JSON 解析失败")
         }
         let o = (obj["claudeAiOauth"] as? [String: Any]) ?? obj
         let tok = o["accessToken"] as? String
         let exp = (o["expiresAt"] as? NSNumber)?.doubleValue
-        return Credential(accessToken: tok, expiresAtMs: exp,
+        return Credential(accessToken: tok,
+                          refreshToken: o["refreshToken"] as? String,
+                          scopes: (o["scopes"] as? [String]) ?? [],
+                          expiresAtMs: exp,
                           diag: tok == nil ? "凭据里无 accessToken 字段（API-key 用户？）" : "")
     }
 
@@ -365,6 +377,66 @@ final class Store: ObservableObject {
         let exp = Date(timeIntervalSince1970: ms / 1000)
         let rem = exp.timeIntervalSince(Date())
         return "\(fmt(exp))(\(rem >= 0 ? "剩\(Int(rem / 60))m" : "已过期\(Int(-rem / 60))m"))"
+    }
+
+    // 是否该提前换 token。expiresAt 未知时返回 false —— 不主动刷，交给 401 分支兜底。
+    func tokenNeedsRefresh(_ expiresAtMs: Double?) -> Bool {
+        guard let ms = expiresAtMs else { return false }
+        return Date(timeIntervalSince1970: ms / 1000).timeIntervalSinceNow < tokenRefreshBufferSec
+    }
+
+    // 用钥匙串里的 refreshToken 换一张新的 access token。
+    //
+    // 走的是 CLI 官方的非交互刷新入口（CLAUDE_CODE_OAUTH_REFRESH_TOKEN + `claude auth login`）：
+    // 内部就是一次 grant_type=refresh_token 交换，**不发任何推理请求、不开 5h 窗口、不耗用量**，
+    // 实测 ~2.5s 换到一张满血 8 小时的新 token。
+    //
+    // 为什么必须借 CLI 而不是 App 自己 POST /v1/oauth/token：
+    //   服务端**每次都轮换 refresh token**（实测两次调用 refreshToken 全变）。App 自己换而不写回钥匙串，
+    //   CLI 手里那个就作废了，下次 claude 起来直接要求重新登录。交给 CLI，写回和轮换都是它的事。
+    //
+    // 为什么不需要跟 CLI 抢锁、也不需要判断“有没有 claude 在跑”：
+    //   一是本地交互式会话空闲时根本不刷 token（只在真要发 API 请求时懒刷新，没有后台定时器），
+    //     所以“有 claude 窗口开着”对“token 会不会被别人刷”毫无预测力，拿它当闸门只会挡住自己；
+    //   二是 CLI 的刷新逻辑本来就按“随时可能有兄弟进程在旁边轮换”写的——它在加锁后、POST 前会重读
+    //     钥匙串比对 accessToken，交换失败后也会先重读、发现已被换掉就直接当成功返回，
+    //     连清 dead token 那步都有 refreshToken 的 CAS 守卫。竞态是良性的。
+    @discardableResult
+    func refreshOAuthToken(_ cred: Credential) async -> Bool {
+        if busyRefreshingToken { return false }
+        busyRefreshingToken = true
+        defer { busyRefreshingToken = false }
+        guard let rt = cred.refreshToken, !rt.isEmpty, !cred.scopes.isEmpty else {
+            log("TOKEN refresh 跳过：钥匙串缺 refreshToken 或 scopes（API-key 用户？）")
+            return false
+        }
+        var env = baseEnv()
+        env["CLAUDE_CODE_OAUTH_REFRESH_TOKEN"] = rt              // 只进子进程环境，绝不落日志
+        env["CLAUDE_CODE_OAUTH_SCOPES"] = cred.scopes.joined(separator: " ")
+        env.removeValue(forKey: "ANTHROPIC_API_KEY")             // 走订阅，别被 API key 抢了认证路径
+        env.removeValue(forKey: "ANTHROPIC_AUTH_TOKEN")
+        let bin = keepaliveClaudeBin
+        log("TOKEN refresh start（当前 \(tokenExpStr(cred.expiresAtMs))）")
+        // 与 fire() 同样用 runDisclaimed：写钥匙串的责任落到子进程，不然本 App 的 ad-hoc 签名会天天弹授权框。
+        // stdin 接 /dev/null：CLI 会把 stdin 当补充输入读，不给 EOF 可能永久挂住。
+        let cmd = "exec '\(bin)' auth login < /dev/null"
+        let r = await Task.detached { Shell.runDisclaimed("/bin/bash", ["-c", cmd], env: env) }.value
+        // 防御性脱敏：万一 CLI 把凭据回显进 stdout/stderr，也不能进日志。
+        let out = r.out.replacingOccurrences(of: rt, with: "<REDACTED>")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let after = await readCredential()
+        if r.code == 0 {
+            log("TOKEN refresh ok → \(tokenExpStr(after.expiresAtMs))")
+            return true
+        }
+        // 反向竞态：CLI 可能抢在我们前面用同一个 refreshToken 换过了，轮换后我们手里这个已失效 →
+        // 我们这次拿到 invalid_grant。但此时钥匙串里其实已经是一张新的有效 token，别误判成失败。
+        if !tokenNeedsRefresh(after.expiresAtMs) {
+            log("TOKEN refresh rc=\(r.code)，但钥匙串已被其它进程刷新 → \(tokenExpStr(after.expiresAtMs))，按成功继续")
+            return true
+        }
+        log("TOKEN refresh failed rc=\(r.code): \(String(out.prefix(160)))")
+        return false
     }
 
     // 代理是否开启：api.anthropic.com 需经代理才可达，未开代理时联网动作必失败。
@@ -387,7 +459,12 @@ final class Store: ObservableObject {
     // 始终只保留一个延迟任务；手动刷新或新的刷新开始时会取消旧任务并重新计时。
     func scheduleRefreshRetry(_ reason: String) {
         guard !paused, refreshRetryTask == nil else { return }
-        let seconds = refreshRetryIntervalSec
+        // 指数退避（3m 起、翻倍、封顶 30m）。失败原因基本都是“要等外部条件恢复”（代理没开、被限流、
+        // 需要重新登录），固定 3 分钟死循环只会把无效请求堆成限流——旧日志里一次 4 小时的过期期
+        // 就这么刷了 80 多条 401/429。成功一次即清零。
+        let seconds = min(refreshRetryIntervalSec * pow(2, Double(refreshRetryFailures)),
+                          refreshRetryMaxIntervalSec)
+        refreshRetryFailures += 1
         log("REFRESH retry scheduled in \(Int(seconds))s: \(reason)")
         refreshRetryTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
@@ -442,60 +519,89 @@ final class Store: ObservableObject {
             scheduleRefreshRetry("代理未开启")
             return
         }
-        let cred = await readCredential()
-        guard let tok = cred.accessToken else {
-            lastError = "无法读取 Keychain token（\(cred.diag)）"
-            log("REFRESH abort: 无法读取 Keychain token — \(cred.diag)")
-            scheduleRefreshRetry("无法读取 Keychain token")
-            return
+        var cred = await readCredential()
+        // token 过期就先换一张再发请求：过期后直接发 GET 必得 401，而空闲的 claude 会话不会替我们刷新，
+        // 于是过去会一路 401 刷到某个 CLI 恰好起来为止（最长一次刷了 4 小时）。换 token 不耗用量、不开窗。
+        if tokenNeedsRefresh(cred.expiresAtMs), await refreshOAuthToken(cred) {
+            cred = await readCredential()
         }
-        let tokExp = tokenExpStr(cred.expiresAtMs)
-        var req = URLRequest(url: usageURL)
-        req.httpMethod = "GET"
-        req.setValue("Bearer \(tok)", forHTTPHeaderField: "Authorization")
-        req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-        req.setValue("claude-code/2.1", forHTTPHeaderField: "User-Agent")
-        req.timeoutInterval = 20
-        do {
-            let (data, resp) = try await URLSession.shared.data(for: req)
-            if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
-                // 关键诊断：状态码 + token 过期状态 + 服务端错误体（含 authentication_error 等具体类型）。
-                // 401 时这行能一眼分清是「token 已过期」还是「被吊销/无效」，不再只看到红字一闪。
-                let body = (String(data: data, encoding: .utf8) ?? "")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                lastError = "usage HTTP \(http.statusCode)"
-                log("REFRESH http \(http.statusCode) tokenExp=\(tokExp) body=\(String(body.prefix(220)))")
-                scheduleRefreshRetry("usage HTTP \(http.statusCode)")
+        // 循环只为 401 后换 token 重试一次；其余每条路径都以 return 收尾，不会转第二圈。
+        var triedTokenRefresh = false
+        while true {
+            guard let tok = cred.accessToken else {
+                lastError = "无法读取 Keychain token（\(cred.diag)）"
+                log("REFRESH abort: 无法读取 Keychain token — \(cred.diag)")
+                scheduleRefreshRetry("无法读取 Keychain token")
                 return
             }
-            let u = try JSONDecoder().decode(UsageResponse.self, from: data)
-            fivePct = u.five_hour?.utilization;         fiveReset = parseISO(u.five_hour?.resets_at)
-            sevenPct = u.seven_day?.utilization;        sevenReset = parseISO(u.seven_day?.resets_at)
-            opusPct = u.seven_day_opus?.utilization;    opusReset = parseISO(u.seven_day_opus?.resets_at)
-            sonnetPct = u.seven_day_sonnet?.utilization; sonnetReset = parseISO(u.seven_day_sonnet?.resets_at)
-            sessionActive = u.limits?.first(where: { $0.kind == "session" })?.is_active   // 仅记日志，不做判断
-            lastError = nil
-            now = Date()
-            lastRefresh = now
-            // 只要服务端返回未来 reset，就更新 windowEnd；否则保持粘滞（见属性注释）。
-            // 这样窗口过期（接口返回 null / 过去值）时 windowEnd 仍指向旧窗口末尾 → 能判定“已关闭”并续窗。
-            // 保活刚开出的新窗口可能 utilization=0%，但 resets_at 已在未来；这仍是有效窗口。
-            let hasActiveWindow = fiveReset.map { $0.timeIntervalSince(now) > 0 } ?? false
-            if hasActiveWindow { windowEnd = fiveReset }
-            // 关键诊断日志：原始 resets_at / 用量 / is_active 全记下——下次窗口过期时这行会揭示接口的真实返回
-            log("REFRESH ok five=\(pctStr(fivePct)) rawReset=\(fmt(fiveReset)) tokenExp=\(tokExp) sessionActive=\(boolStr(sessionActive)) → windowEnd=\(fmt(windowEnd)) (active=\(hasActiveWindow))")
-            if windowEnd == nil, claudeAutoEnabled {
-                // 服务端已明确当前没有活动窗口。立即尝试激活，并持续重查直到拿到新 reset。
-                scheduleRefreshRetry("查询成功但 five_hour.resets_at=nil")
-                maybeBootstrapMissingWindow()
+            // token 仍是过期的（上面换失败，多半 refreshToken 也废了）→ 别再发这一发注定 401 的请求。
+            // 这是 401/429 刷屏的止血点：无效凭据一次都不该打出去，429 本来就是这么被限流出来的。
+            if tokenNeedsRefresh(cred.expiresAtMs) {
+                lastError = "token 已过期且刷新失败，需重新登录 claude"
+                log("REFRESH abort: token \(tokenExpStr(cred.expiresAtMs)) 且刷新失败 → 跳过 GET（需 claude auth login）")
+                scheduleRefreshRetry("token 过期且刷新失败")
+                return
             }
-        } catch {
-            // 带上 NSError 的 domain#code：区分连接中断(-1005)/超时(-1001)/离线(-1009)/SSL(-1200) 等，
-            // 对代理不稳的场景特别有用——localizedDescription 三种都可能是「网络连接已丢失」。
-            let ns = error as NSError
-            lastError = "查询失败: \(error.localizedDescription)"
-            log("REFRESH failed: \(ns.domain)#\(ns.code) \(error.localizedDescription)")
-            scheduleRefreshRetry("\(ns.domain)#\(ns.code)")
+            let tokExp = tokenExpStr(cred.expiresAtMs)
+            var req = URLRequest(url: usageURL)
+            req.httpMethod = "GET"
+            req.setValue("Bearer \(tok)", forHTTPHeaderField: "Authorization")
+            req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+            req.setValue("claude-code/2.1", forHTTPHeaderField: "User-Agent")
+            req.timeoutInterval = 20
+            do {
+                let (data, resp) = try await URLSession.shared.data(for: req)
+                if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
+                    // 关键诊断：状态码 + token 过期状态 + 服务端错误体（含 authentication_error 等具体类型）。
+                    // 401 时这行能一眼分清是「token 已过期」还是「被吊销/无效」，不再只看到红字一闪。
+                    let body = (String(data: data, encoding: .utf8) ?? "")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    // 401 但本地看着 token 没过期 → 多半是被吊销/服务端不认。换一张再试一次（只一次，防循环）。
+                    if http.statusCode == 401, !triedTokenRefresh {
+                        triedTokenRefresh = true
+                        log("REFRESH http 401 tokenExp=\(tokExp)（本地未过期）→ 换新 token 后重试一次")
+                        if await refreshOAuthToken(cred) {
+                            cred = await readCredential()
+                            continue
+                        }
+                    }
+                    lastError = "usage HTTP \(http.statusCode)"
+                    log("REFRESH http \(http.statusCode) tokenExp=\(tokExp) body=\(String(body.prefix(220)))")
+                    scheduleRefreshRetry("usage HTTP \(http.statusCode)")
+                    return
+                }
+                refreshRetryFailures = 0   // 拿到 200 → 退避指数清零，下次失败重新从 3 分钟起算
+                let u = try JSONDecoder().decode(UsageResponse.self, from: data)
+                fivePct = u.five_hour?.utilization;         fiveReset = parseISO(u.five_hour?.resets_at)
+                sevenPct = u.seven_day?.utilization;        sevenReset = parseISO(u.seven_day?.resets_at)
+                opusPct = u.seven_day_opus?.utilization;    opusReset = parseISO(u.seven_day_opus?.resets_at)
+                sonnetPct = u.seven_day_sonnet?.utilization; sonnetReset = parseISO(u.seven_day_sonnet?.resets_at)
+                sessionActive = u.limits?.first(where: { $0.kind == "session" })?.is_active   // 仅记日志，不做判断
+                lastError = nil
+                now = Date()
+                lastRefresh = now
+                // 只要服务端返回未来 reset，就更新 windowEnd；否则保持粘滞（见属性注释）。
+                // 这样窗口过期（接口返回 null / 过去值）时 windowEnd 仍指向旧窗口末尾 → 能判定“已关闭”并续窗。
+                // 保活刚开出的新窗口可能 utilization=0%，但 resets_at 已在未来；这仍是有效窗口。
+                let hasActiveWindow = fiveReset.map { $0.timeIntervalSince(now) > 0 } ?? false
+                if hasActiveWindow { windowEnd = fiveReset }
+                // 关键诊断日志：原始 resets_at / 用量 / is_active 全记下——下次窗口过期时这行会揭示接口的真实返回
+                log("REFRESH ok five=\(pctStr(fivePct)) rawReset=\(fmt(fiveReset)) tokenExp=\(tokExp) sessionActive=\(boolStr(sessionActive)) → windowEnd=\(fmt(windowEnd)) (active=\(hasActiveWindow))")
+                if windowEnd == nil, claudeAutoEnabled {
+                    // 服务端已明确当前没有活动窗口。立即尝试激活，并持续重查直到拿到新 reset。
+                    scheduleRefreshRetry("查询成功但 five_hour.resets_at=nil")
+                    maybeBootstrapMissingWindow()
+                }
+                return
+            } catch {
+                // 带上 NSError 的 domain#code：区分连接中断(-1005)/超时(-1001)/离线(-1009)/SSL(-1200) 等，
+                // 对代理不稳的场景特别有用——localizedDescription 三种都可能是「网络连接已丢失」。
+                let ns = error as NSError
+                lastError = "查询失败: \(error.localizedDescription)"
+                log("REFRESH failed: \(ns.domain)#\(ns.code) \(error.localizedDescription)")
+                scheduleRefreshRetry("\(ns.domain)#\(ns.code)")
+                return
+            }
         }
     }
 
@@ -714,7 +820,8 @@ final class Store: ObservableObject {
         Task { try? await Task.sleep(nanoseconds: 3_000_000_000); await refresh() }
     }
 
-    func refreshNow() { Task { await refresh() } }
+    // 手动刷新：清零退避指数，否则退到 30 分钟后用户点“刷新”还得按老节奏等——手动动作应当立刻生效。
+    func refreshNow() { refreshRetryFailures = 0; Task { await refresh() } }
 
     // 暂停 / 恢复：暂停后停止 GET 与续窗；恢复后立即刷新一次
     func togglePause() {
@@ -882,6 +989,100 @@ struct UsageSections: View {
     }
 }
 
+// 卡片式开关：不再使用系统滑轨。整张卡片/整行都是点击区域，开启时以轻量强调色和勾选标记反馈。
+// 仍然只修改传入的 Binding，具体副作用（例如 SMAppService）继续由 Binding 的 setter 负责。
+struct ToggleCheckmark: View {
+    let isOn: Bool
+    var compact = false
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(isOn ? Color.accentColor : Color.primary.opacity(0.055))
+            Circle()
+                .strokeBorder(isOn ? Color.accentColor : Color.secondary.opacity(0.28), lineWidth: 1)
+            if isOn {
+                Image(systemName: "checkmark")
+                    .font(.system(size: compact ? 8 : 9, weight: .bold))
+                    .foregroundStyle(.white)
+            }
+        }
+        .frame(width: compact ? 18 : 22, height: compact ? 18 : 22)
+    }
+}
+
+struct KeepAliveToggleCard: View {
+    let title: String
+    let mark: String
+    @Binding var isOn: Bool
+
+    var body: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.16)) { isOn.toggle() }
+        } label: {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .top) {
+                    Text(mark)
+                        .font(.caption2.weight(.semibold).monospaced())
+                        .foregroundStyle(isOn ? Color.white : Color.secondary)
+                        .frame(width: 28, height: 28)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(isOn ? Color.accentColor : Color.primary.opacity(0.075))
+                        )
+                    Spacer(minLength: 8)
+                    ToggleCheckmark(isOn: isOn)
+                }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).font(.caption.weight(.semibold))
+                    Text(isOn ? "正在保活" : "已关闭")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, minHeight: 96, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(isOn ? Color.accentColor.opacity(0.095) : Color.primary.opacity(0.035))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(isOn ? Color.accentColor.opacity(0.38) : Color.secondary.opacity(0.18), lineWidth: 1)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(title) 保活")
+        .accessibilityValue(isOn ? "已开启" : "已关闭")
+    }
+}
+
+struct SettingsToggleRow: View {
+    let title: String
+    @Binding var isOn: Bool
+
+    var body: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.16)) { isOn.toggle() }
+        } label: {
+            HStack(spacing: 10) {
+                Text(title).font(.caption)
+                Spacer()
+                ToggleCheckmark(isOn: isOn, compact: true)
+            }
+            .padding(.horizontal, 11)
+            .frame(height: 42)
+            .background(isOn ? Color.accentColor.opacity(0.055) : Color.clear)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
+        .accessibilityValue(isOn ? "已开启" : "已关闭")
+    }
+}
+
 // 下半部分：开关、按钮、上次保活结果 —— 只出现在点击弹窗里，悬停快照不含这些
 struct ControlSections: View {
     @EnvironmentObject var s: Store
@@ -901,33 +1102,42 @@ struct ControlSections: View {
             if let t = blockedText {
                 Text(t).font(.caption).foregroundStyle(.secondary)
             }
-            HStack {
-                Text("Claude 保活").font(.caption)
-                Spacer()
-                Toggle("", isOn: $s.claudeAutoEnabled).toggleStyle(.switch).labelsHidden()
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("保活")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 4)
+                HStack(spacing: 8) {
+                    KeepAliveToggleCard(title: "Claude", mark: "C", isOn: $s.claudeAutoEnabled)
+                    KeepAliveToggleCard(title: "Codex", mark: ">_", isOn: $s.codexAutoEnabled)
+                }
             }
-            HStack {
-                Text("Codex 保活").font(.caption)
-                Spacer()
-                Toggle("", isOn: $s.codexAutoEnabled).toggleStyle(.switch).labelsHidden()
-            }
-            HStack {
-                Text("开机自启").font(.caption)
-                Spacer()
-                Toggle("", isOn: Binding(
-                    get: { s.launchAtLogin },
-                    set: { s.setLaunchAtLogin($0) }
-                )).toggleStyle(.switch).labelsHidden()
-            }
-            HStack {
-                Text("自动查询").font(.caption)
-                Spacer()
-                Toggle("", isOn: $s.autoQueryOnOpen).toggleStyle(.switch).labelsHidden()
-            }
-            HStack {
-                Text("隐藏倒计时").font(.caption)
-                Spacer()
-                Toggle("", isOn: $s.hideCountdown).toggleStyle(.switch).labelsHidden()
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("应用")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 4)
+                VStack(spacing: 0) {
+                    SettingsToggleRow(title: "开机自启", isOn: Binding(
+                        get: { s.launchAtLogin },
+                        set: { s.setLaunchAtLogin($0) }
+                    ))
+                    Divider().padding(.leading, 11)
+                    SettingsToggleRow(title: "自动查询", isOn: $s.autoQueryOnOpen)
+                    Divider().padding(.leading, 11)
+                    SettingsToggleRow(title: "隐藏倒计时", isOn: $s.hideCountdown)
+                }
+                .background(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(Color.primary.opacity(0.035))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(Color.secondary.opacity(0.18), lineWidth: 1)
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             }
 
             HStack(spacing: 8) {
