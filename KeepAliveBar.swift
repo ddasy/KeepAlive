@@ -964,7 +964,7 @@ struct UsageSections: View {
                 Circle().fill(s.paused ? .gray : sevColor(maxPct)).frame(width: 9, height: 9)
             }
 
-            usageRow("5 小时会话", s.fivePct, s.fiveReset)
+            usageRow("5小时", s.fivePct, s.fiveReset)
             usageRow("周限", s.sevenPct, s.sevenReset, weekly: true)
             if s.opusPct != nil { usageRow("周 · Opus", s.opusPct, s.opusReset, weekly: true) }
             if s.sonnetPct != nil { usageRow("周 · Sonnet", s.sonnetPct, s.sonnetReset, weekly: true) }
@@ -973,9 +973,6 @@ struct UsageSections: View {
             HStack {
                 Text("Codex").font(.headline)
                 Spacer()
-                if let p = s.codexPlan {
-                    Text(p).font(.caption2).foregroundStyle(.secondary)
-                }
             }
             codexRow("5 小时", s.codexPrimaryUsed, s.codexPrimaryReset, withDate: false)
             codexRow("周限", s.codexWeeklyUsed, s.codexWeeklyReset, withDate: true)
@@ -1013,7 +1010,7 @@ struct UsageSections: View {
             if rolledOff {
                 Text("已重置（快照过期，无实时数据）").font(.caption2).foregroundStyle(.secondary)
             } else if let r = reset {
-                Text(withDate ? weeklyResetInfo(r, s.now) : "重置 \(localHM(r))")
+                Text(withDate ? weeklyResetInfo(r, s.now) : resetInfo(r, s.now))
                     .font(.caption2).foregroundStyle(.secondary)
             } else {
                 Text("暂无快照").font(.caption2).foregroundStyle(.secondary)
