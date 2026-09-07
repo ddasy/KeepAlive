@@ -160,6 +160,34 @@ enum CrossKeepalivePolicy {
 // MARK: - End CrossKeepalivePolicy
 
 // MARK: - 状态与调度
+enum AutomaticOrder {
+    static func codexFirst(current: Bool, now: Date,
+                           claudeEnd: Date?, claudeUsed: Double?,
+                           codexEnd: Date?, codexUsed: Double?) -> Bool {
+        func usage(_ used: Double?, _ end: Date?) -> Double? {
+            guard let used, used.isFinite, used >= 0 else { return nil }
+            // 过期快照中的 100% 不再代表当前窗口已用尽。
+            return end.map { $0 <= now } == true ? 0 : used
+        }
+        let c = usage(claudeUsed, claudeEnd), x = usage(codexUsed, codexEnd)
+        if let c, let x {
+            if c >= 100 && x < 100 { return true }
+            if x >= 100 && c < 100 { return false }
+            if c >= 100 && x >= 100 { return current }
+        }
+        func deadline(_ end: Date?) -> Date? {
+            guard let end, end > now, end.timeIntervalSince(now) <= 5 * 3600 else { return nil }
+            return end
+        }
+        switch (deadline(claudeEnd), deadline(codexEnd)) {
+        case let (c?, x?): return c == x ? current : x < c
+        case (_?, nil): return false
+        case (nil, _?): return true
+        case (nil, nil): return current
+        }
+    }
+}
+
 @MainActor
 final class Store: ObservableObject {
     // 单例：SwiftUI 场景与 AppDelegate（悬停快照）共用同一份状态
@@ -234,12 +262,22 @@ final class Store: ObservableObject {
     @Published var autoQueryOnOpen: Bool {                        // 打开菜单栏弹窗时是否自动查询一次用量
         didSet { UserDefaults.standard.set(autoQueryOnOpen, forKey: "autoQueryOnOpen") }
     }
-    @Published var hideCountdown: Bool {                          // 隐藏倒计时：菜单栏只留图标，不显示 Claude 下次重置剩余时间
+    @Published var hideCountdown: Bool {                          // 隐藏倒计时：菜单栏只留图标
         didSet { UserDefaults.standard.set(hideCountdown, forKey: "hideCountdown") }
     }
     @Published var popupOpen = false                              // 主弹窗是否正开着（悬停快照据此避让，见 HoverSnapshot）
     @Published var codexFirst = UserDefaults.standard.bool(forKey: "codexFirst") {
         didSet { UserDefaults.standard.set(codexFirst, forKey: "codexFirst") }
+    }
+    @Published var automaticSorting = UserDefaults.standard.bool(forKey: "automaticSorting") {
+        didSet { UserDefaults.standard.set(automaticSorting, forKey: "automaticSorting") }
+    }
+    var displayedCodexFirst: Bool {
+        guard automaticSorting else { return codexFirst }
+        return AutomaticOrder.codexFirst(current: codexFirst, now: now,
+            claudeEnd: fiveReset ?? windowEnd, claudeUsed: fivePct,
+            codexEnd: codexWindowClosed ? nil : codexPrimaryReset,
+            codexUsed: codexWindowClosed ? 0 : codexPrimaryUsed)
     }
 
     let bufferSec: TimeInterval = 90        // 真实重置时刻之后再等这么久才发（确保旧窗口确已关闭）
@@ -370,16 +408,18 @@ final class Store: ObservableObject {
         }
     }
 
-    // 菜单栏标题：仅显示距 5h 窗口重置的剩余时间（图标已是 Clawd，去掉闪电标识）
+    // 菜单栏标题与图标共用 displayedCodexFirst，始终显示置顶 AI 的 5h 窗口。
     // 返回 "" 表示“菜单栏只留图标”（隐藏倒计时）；暂停态仍保留 ⏸——它是运行状态而非刷新时间，
     // 否则关掉保活后菜单栏毫无痕迹，容易忘了自己按过暂停。
     var menuTitle: String {
         if paused { return "⏸" }
         if hideCountdown { return "" }
-        if let until = crossWaitUntil(claude: true), claudeIsDue {
+        let codex = displayedCodexFirst
+        if let until = crossWaitUntil(claude: !codex), codex ? codexIsDue : claudeIsDue {
             return "↔ " + Store.hhmm(until.timeIntervalSince(now))
         }
-        guard let end = windowEnd else { return "–" }   // 还没见过任何活动窗口
+        if codex && codexWindowClosed { return "now" }
+        guard let end = codex ? codexPrimaryReset : windowEnd else { return "–" }
         let rem = end.timeIntervalSince(now)
         return rem <= 0 ? "now" : Store.hhmm(rem)       // 已过末尾 → "now"（等待续窗）
     }
@@ -1400,12 +1440,10 @@ struct UsageSections: View {
     var allowsReordering = false
     @State private var selectedCodex: Bool?
 
-    var maxPct: Double { max(s.fivePct ?? 0, s.sevenPct ?? 0) }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            ForEach(s.codexFirst ? [true, false] : [false, true], id: \.self) { codex in
-                if codex != s.codexFirst { Divider() }
+            ForEach(s.displayedCodexFirst ? [true, false] : [false, true], id: \.self) { codex in
+                if codex != s.displayedCodexFirst { Divider() }
                 VStack(alignment: .leading, spacing: 12) {
                     sectionHeader(codex: codex)
                     if codex {
@@ -1425,9 +1463,9 @@ struct UsageSections: View {
 
     private func sectionHeader(codex: Bool) -> some View {
         let title = codex ? "Codex" : "Claude"
-        let isFirst = codex == s.codexFirst
+        let isFirst = codex == s.displayedCodexFirst
         return HStack(spacing: 6) {
-            if allowsReordering {
+            if allowsReordering && !s.automaticSorting {
                 Button {
                     selectedCodex = selectedCodex == codex ? nil : codex
                 } label: {
@@ -1447,9 +1485,6 @@ struct UsageSections: View {
             } else {
                 Text(title).font(.headline)
                 Spacer()
-            }
-            if !codex {
-                Circle().fill(s.paused ? .gray : sevColor(maxPct)).frame(width: 9, height: 9)
             }
         }
     }
@@ -1692,6 +1727,9 @@ struct ControlSections: View {
                     ))
                     Divider().padding(.leading, 11)
                     SettingsToggleRow(title: "自动查询", isOn: $s.autoQueryOnOpen)
+                    Divider().padding(.leading, 11)
+                    SettingsToggleRow(title: "自动排序", isOn: $s.automaticSorting)
+                        .help("优先显示 5 小时内较早到期的 AI；用满后切换到仍有额度的 AI。关闭后恢复手动顺序。")
                     Divider().padding(.leading, 11)
                     SettingsToggleRow(title: "隐藏倒计时", isOn: $s.hideCountdown)
                 }
@@ -1990,7 +2028,7 @@ struct KeepAliveBarApp: App {
         MenuBarExtra {
             ContentView().environmentObject(store)
         } label: {
-            if let img = store.codexFirst ? MenuBarArtwork.codex : KeepAliveBarApp.clawd {
+            if let img = store.displayedCodexFirst ? MenuBarArtwork.codex : KeepAliveBarApp.clawd {
                 Image(nsImage: img)
                 // menuTitle 为空 = 隐藏倒计时：整段 Text 都不放，避免留下一块空白间距
                 if !store.menuTitle.isEmpty { Text(store.menuTitle) }
