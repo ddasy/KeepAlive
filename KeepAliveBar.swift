@@ -238,6 +238,9 @@ final class Store: ObservableObject {
         didSet { UserDefaults.standard.set(hideCountdown, forKey: "hideCountdown") }
     }
     @Published var popupOpen = false                              // 主弹窗是否正开着（悬停快照据此避让，见 HoverSnapshot）
+    @Published var codexFirst = UserDefaults.standard.bool(forKey: "codexFirst") {
+        didSet { UserDefaults.standard.set(codexFirst, forKey: "codexFirst") }
+    }
 
     let bufferSec: TimeInterval = 90        // 真实重置时刻之后再等这么久才发（确保旧窗口确已关闭）
     let retryIntervalSec: TimeInterval = 180 // 两次“尝试”最小间隔：失败/未续窗时按此退避重试（3 分钟）
@@ -403,18 +406,23 @@ final class Store: ObservableObject {
         codexWindowClosed || (codexPrimaryReset.map { Date().timeIntervalSince($0) >= codexBufferSec } ?? false)
     }
 
+    func crossWindowStart(claude: Bool) -> Date? {
+        // 重置时间减 5h 是服务端周期起点；只在没有真值时用成功发送时间兜底。
+        let end = claude ? windowEnd : codexCrossWindowEnd
+        let fire = claude ? lastFire : codexLastFire
+        if let end, !(fire.map { $0 > end } ?? false) {
+            return end.addingTimeInterval(-CrossKeepalivePolicy.window)
+        } else {
+            return fire
+        }
+    }
+
     func crossWaitUntil(claude: Bool) -> Date? {
         guard crossActive else { return nil }
-        // 重置时间减 5h 是服务端周期起点；只在没有真值时用成功发送时间兜底。
-        let otherEnd = claude ? codexCrossWindowEnd : windowEnd
-        let otherFire = claude ? codexLastFire : lastFire
-        let otherStart: Date?
-        if let end = otherEnd, !(otherFire.map { $0 > end } ?? false) {
-            otherStart = end.addingTimeInterval(-CrossKeepalivePolicy.window)
-        } else {
-            otherStart = otherFire
-        }
-        return CrossKeepalivePolicy.deferredUntil(now: Date(), otherStart: otherStart, minutes: crossIntervalMinutes)
+        return CrossKeepalivePolicy.deferredUntil(
+            now: Date(),
+            otherStart: crossWindowStart(claude: !claude),
+            minutes: crossIntervalMinutes)
     }
 
     func crossAllowsFire(claude: Bool) -> Bool {
@@ -446,7 +454,12 @@ final class Store: ObservableObject {
         if codexIsDue, let until = crossWaitUntil(claude: false) {
             return "Codex 交叉等待至 \(localMDHM(until))"
         }
-        return "间隔足够时正常保活；过近时延后"
+        guard let claudeStart = crossWindowStart(claude: true),
+              let codexStart = crossWindowStart(claude: false) else {
+            return "当前实际间隔：暂无数据"
+        }
+        let interval = abs(claudeStart.timeIntervalSince(codexStart))
+        return "当前实际间隔：\(Store.dhm(interval))"
     }
 
     func tick() {
@@ -690,7 +703,7 @@ final class Store: ObservableObject {
         if !crossActive { maybeActCodex() }
         guard !paused else { return }   // 暂停：仅停止 Claude 的 GET 与续窗（不影响上面的 Codex）
         guard await proxyEnabled() else {   // 前置条件：代理未开则跳过用量刷新（Codex 已在上方读完）
-            lastError = "代理未开启，已跳过用量刷新"
+            lastError = "Claude：代理未开启，已跳过用量刷新"
             log("REFRESH abort: 代理未开启")
             scheduleRefreshRetry("代理未开启")
             return
@@ -705,7 +718,7 @@ final class Store: ObservableObject {
         var triedTokenRefresh = false
         while true {
             guard let tok = cred.accessToken else {
-                lastError = "无法读取 Keychain token（\(cred.diag)）"
+                lastError = "Claude：无法读取 Keychain token（\(cred.diag)）"
                 log("REFRESH abort: 无法读取 Keychain token — \(cred.diag)")
                 scheduleRefreshRetry("无法读取 Keychain token")
                 return
@@ -713,7 +726,7 @@ final class Store: ObservableObject {
             // token 仍是过期的（上面换失败，多半 refreshToken 也废了）→ 别再发这一发注定 401 的请求。
             // 这是 401/429 刷屏的止血点：无效凭据一次都不该打出去，429 本来就是这么被限流出来的。
             if tokenNeedsRefresh(cred.expiresAtMs) {
-                lastError = "token 已过期且刷新失败，需重新登录 claude"
+                lastError = "Claude：token 已过期且刷新失败，需重新登录 claude"
                 log("REFRESH abort: token \(tokenExpStr(cred.expiresAtMs)) 且刷新失败 → 跳过 GET（需 claude auth login）")
                 scheduleRefreshRetry("token 过期且刷新失败")
                 return
@@ -741,7 +754,7 @@ final class Store: ObservableObject {
                             continue
                         }
                     }
-                    lastError = "usage HTTP \(http.statusCode)"
+                    lastError = "Claude：usage HTTP \(http.statusCode)"
                     log("REFRESH http \(http.statusCode) tokenExp=\(tokExp) body=\(String(body.prefix(220)))")
                     scheduleRefreshRetry("usage HTTP \(http.statusCode)")
                     return
@@ -774,7 +787,7 @@ final class Store: ObservableObject {
                 // 带上 NSError 的 domain#code：区分连接中断(-1005)/超时(-1001)/离线(-1009)/SSL(-1200) 等，
                 // 对代理不稳的场景特别有用——localizedDescription 三种都可能是「网络连接已丢失」。
                 let ns = error as NSError
-                lastError = "查询失败: \(error.localizedDescription)"
+                lastError = "Claude：查询失败：\(error.localizedDescription)"
                 log("REFRESH failed: \(ns.domain)#\(ns.code) \(error.localizedDescription)")
                 scheduleRefreshRetry("\(ns.domain)#\(ns.code)")
                 return
@@ -1188,7 +1201,7 @@ final class Store: ObservableObject {
             cred = await readCredential()
         }
         guard let tok = cred.accessToken, !tokenNeedsRefresh(cred.expiresAtMs) else {
-            lastFireResult = "保活失败：无可用 token（\(cred.diag)），需重新登录 claude"
+            lastFireResult = "Claude 保活失败：无可用 token（\(cred.diag)），需重新登录 claude"
             log("FIRE direct 失败：无可用 token（\(cred.diag)）—— 窗口未续")
             return false
         }
@@ -1213,14 +1226,14 @@ final class Store: ObservableObject {
                 let b = (String(data: data, encoding: .utf8) ?? "")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 let mins = Int(retryIntervalSec / 60)
-                lastFireResult = "保活失败：直连 HTTP \(code)，约 \(mins) 分钟后重试"
+                lastFireResult = "Claude 保活失败：直连 HTTP \(code)，约 \(mins) 分钟后重试"
                 log("FIRE direct HTTP \(code) tokenExp=\(tokenExpStr(cred.expiresAtMs)) —— 窗口未续: \(String(b.prefix(160)))")
                 return false
             }
         } catch {
             let ns = error as NSError
             let mins = Int(retryIntervalSec / 60)
-            lastFireResult = "保活失败：\(error.localizedDescription)，约 \(mins) 分钟后重试"
+            lastFireResult = "Claude 保活失败：\(error.localizedDescription)，约 \(mins) 分钟后重试"
             log("FIRE direct failed: \(ns.domain)#\(ns.code) \(error.localizedDescription) —— 窗口未续")
             return false
         }
@@ -1236,14 +1249,14 @@ final class Store: ObservableObject {
             if let e = windowEnd, e.timeIntervalSinceNow > 0 { end = e; break }
         }
         guard let end else {
-            lastFireResult = "⚠️ 直连 HTTP 200 但 125s 内未见新窗口 —— 直连开窗可能已失效"
+            lastFireResult = "⚠️ Claude 直连 HTTP 200 但 125s 内未见新窗口 —— 直连开窗可能已失效"
             log("FIRE direct HTTP 200 但 125s 内未见新窗口（windowEnd=\(fmt(windowEnd)) rawReset=\(fmt(fiveReset))）—— 直连开窗可能已失效，需要人工判断；临时退回：defaults write com.iu.keepalivebar directFire -bool false")
             return false
         }
         let stamp = Date()
         lastFire = stamp
         UserDefaults.standard.set(stamp.timeIntervalSince1970, forKey: "lastFire")
-        lastFireResult = "保活成功（直连，~8 tokens）：新窗口 \(fmt(end)) 重置"
+        lastFireResult = "Claude 保活成功（直连，~8 tokens）：新窗口 \(fmt(end)) 重置"
         log("FIRED direct -> 新窗口 windowEnd=\(fmt(end))")
         return true
     }
@@ -1254,7 +1267,7 @@ final class Store: ObservableObject {
         do {
             temporaryDirectory = try makeTemporaryKeepaliveDirectory()
         } catch {
-            lastFireResult = "保活失败：无法创建临时目录（\(error.localizedDescription)）"
+            lastFireResult = "Claude 保活失败：无法创建临时目录（\(error.localizedDescription)）"
             log("FAILED: 无法创建临时目录：\(error.localizedDescription)")
             return
         }
@@ -1273,12 +1286,12 @@ final class Store: ObservableObject {
             let stamp = Date()
             lastFire = stamp
             UserDefaults.standard.set(stamp.timeIntervalSince1970, forKey: "lastFire")
-            lastFireResult = "保活成功：\(String(trimmed.prefix(60)))"
+            lastFireResult = "Claude 保活成功：\(String(trimmed.prefix(60)))"
             log("FIRED -> \(String(trimmed.prefix(100)))")
         } else {
             // 失败：不更新 lastFire（窗口仍算未续），lastAttempt 已记 → retryIntervalSec 后自动重试
             let mins = Int(retryIntervalSec / 60)
-            lastFireResult = "保活失败 (rc=\(r.code))，约 \(mins) 分钟后自动重试：\(String(trimmed.prefix(80)))"
+            lastFireResult = "Claude 保活失败 (rc=\(r.code))，约 \(mins) 分钟后自动重试：\(String(trimmed.prefix(80)))"
             log("FAILED rc=\(r.code) (retry in \(mins)m): \(String(trimmed.prefix(160)))")
         }
         Task { try? await Task.sleep(nanoseconds: 3_000_000_000); await refresh() }
@@ -1308,7 +1321,7 @@ final class Store: ObservableObject {
             }
             lastError = nil
         } catch {
-            lastError = "开机自启设置失败：\(error.localizedDescription)（可在系统设置手动添加）"
+            lastError = "应用：开机自启设置失败：\(error.localizedDescription)（可在系统设置手动添加）"
         }
         launchAtLogin = (SMAppService.mainApp.status == .enabled)
         if on { SMAppService.openSystemSettingsLoginItems() }  // 跳转设置
@@ -1378,36 +1391,82 @@ func weeklyResetInfo(_ reset: Date?, _ now: Date) -> String {
 
 // MARK: - 弹窗界面
 // 弹窗被拆成两块，方便悬停快照直接复用上半部分：
-//   · UsageSections —— Claude / Codex 用量。纯展示，无任何副作用（不查询、不写状态）。
+//   · UsageSections —— Claude / Codex 用量；主弹窗可排序，悬停快照只展示。
 //   · ControlSections —— 开关、按钮、上次保活结果等“操作与诊断”。
 // 主弹窗 = UsageSections + ControlSections；悬停快照 = UsageSections（见 SnapshotView）。
 // 两者共用同一份渲染代码，改一处两边同步，绝不会出现“快照和弹窗对不上”。
 struct UsageSections: View {
     @EnvironmentObject var s: Store
+    var allowsReordering = false
+    @State private var selectedCodex: Bool?
 
     var maxPct: Double { max(s.fivePct ?? 0, s.sevenPct ?? 0) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text("Claude").font(.headline)
+            ForEach(s.codexFirst ? [true, false] : [false, true], id: \.self) { codex in
+                if codex != s.codexFirst { Divider() }
+                VStack(alignment: .leading, spacing: 12) {
+                    sectionHeader(codex: codex)
+                    if codex {
+                        codexRow("5 小时", s.codexPrimaryUsed, s.codexPrimaryReset, withDate: false, closed: s.codexWindowClosed)
+                        codexRow("周限", s.codexWeeklyUsed, s.codexWeeklyReset, withDate: true)
+                    } else {
+                        usageRow("5小时", s.fivePct, s.fiveReset)
+                        usageRow("周限", s.sevenPct, s.sevenReset, weekly: true)
+                        if s.opusPct != nil { usageRow("周 · Opus", s.opusPct, s.opusReset, weekly: true) }
+                        if s.sonnetPct != nil { usageRow("周 · Sonnet", s.sonnetPct, s.sonnetReset, weekly: true) }
+                    }
+                }
+            }
+        }
+        .onDisappear { selectedCodex = nil }
+    }
+
+    private func sectionHeader(codex: Bool) -> some View {
+        let title = codex ? "Codex" : "Claude"
+        let isFirst = codex == s.codexFirst
+        return HStack(spacing: 6) {
+            if allowsReordering {
+                Button {
+                    selectedCodex = selectedCodex == codex ? nil : codex
+                } label: {
+                    HStack {
+                        Text(title).font(.headline)
+                        Spacer(minLength: 0)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("点击调整 \(title) 的位置")
+                .accessibilityLabel("\(title)，调整顺序")
+                if selectedCodex == codex {
+                    moveButton(title: title, up: true, enabled: !isFirst)
+                    moveButton(title: title, up: false, enabled: isFirst)
+                }
+            } else {
+                Text(title).font(.headline)
                 Spacer()
+            }
+            if !codex {
                 Circle().fill(s.paused ? .gray : sevColor(maxPct)).frame(width: 9, height: 9)
             }
-
-            usageRow("5小时", s.fivePct, s.fiveReset)
-            usageRow("周限", s.sevenPct, s.sevenReset, weekly: true)
-            if s.opusPct != nil { usageRow("周 · Opus", s.opusPct, s.opusReset, weekly: true) }
-            if s.sonnetPct != nil { usageRow("周 · Sonnet", s.sonnetPct, s.sonnetReset, weekly: true) }
-
-            Divider()
-            HStack {
-                Text("Codex").font(.headline)
-                Spacer()
-            }
-            codexRow("5 小时", s.codexPrimaryUsed, s.codexPrimaryReset, withDate: false, closed: s.codexWindowClosed)
-            codexRow("周限", s.codexWeeklyUsed, s.codexWeeklyReset, withDate: true)
         }
+    }
+
+    private func moveButton(title: String, up: Bool, enabled: Bool) -> some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.16)) { s.codexFirst.toggle() }
+        } label: {
+            Image(systemName: up ? "chevron.up" : "chevron.down")
+                .font(.system(size: 11, weight: .semibold))
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .help("将 \(title)\(up ? "上移" : "下移")")
+        .accessibilityLabel("将 \(title)\(up ? "上移" : "下移")")
     }
 
     @ViewBuilder
@@ -1682,7 +1741,7 @@ struct ContentView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            UsageSections()
+            UsageSections(allowsReordering: true)
             Divider()
             ControlSections()
         }
@@ -1863,6 +1922,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+// 原生矢量绘制：参考图的紫蓝渐变云朵 + 白色终端提示符。
+// drawingHandler 按屏幕倍率渲染，在 Retina 菜单栏上也保持清晰。
+enum MenuBarArtwork {
+    static let codex: NSImage = {
+        if let url = Bundle.main.url(forResource: "codex", withExtension: "png"),
+           let image = NSImage(contentsOf: url) {
+            image.size = NSSize(width: 19.8, height: 19.8)
+            image.isTemplate = false
+            return image
+        }
+        return drawnCodex
+    }()
+
+    private static let drawnCodex = NSImage(size: NSSize(width: 19.8, height: 19.8), flipped: true) { rect in
+        guard let context = NSGraphicsContext.current?.cgContext else { return false }
+        context.saveGState()
+        defer { context.restoreGState() }
+        context.scaleBy(x: rect.width / 100, y: rect.height / 100)
+
+        let cloud = NSBezierPath()
+        cloud.move(to: NSPoint(x: 22, y: 23))
+        cloud.curve(to: NSPoint(x: 61, y: 13), controlPoint1: NSPoint(x: 27, y: 4), controlPoint2: NSPoint(x: 49, y: 0))
+        cloud.curve(to: NSPoint(x: 89, y: 42), controlPoint1: NSPoint(x: 81, y: 7), controlPoint2: NSPoint(x: 95, y: 25))
+        cloud.curve(to: NSPoint(x: 79, y: 81), controlPoint1: NSPoint(x: 102, y: 56), controlPoint2: NSPoint(x: 96, y: 77))
+        cloud.curve(to: NSPoint(x: 40, y: 92), controlPoint1: NSPoint(x: 73, y: 100), controlPoint2: NSPoint(x: 53, y: 103))
+        cloud.curve(to: NSPoint(x: 12, y: 64), controlPoint1: NSPoint(x: 18, y: 98), controlPoint2: NSPoint(x: 7, y: 81))
+        cloud.curve(to: NSPoint(x: 22, y: 23), controlPoint1: NSPoint(x: -1, y: 49), controlPoint2: NSPoint(x: 7, y: 27))
+        cloud.close()
+        NSGradient(starting: NSColor(calibratedRed: 0.70, green: 0.62, blue: 1, alpha: 1),
+                   ending: NSColor(calibratedRed: 0.26, green: 0.23, blue: 1, alpha: 1))?
+            .draw(in: cloud, angle: 90)
+
+        NSColor.white.setStroke()
+        let terminal = NSBezierPath()
+        terminal.lineWidth = 6.5
+        terminal.lineCapStyle = .round
+        terminal.lineJoinStyle = .round
+        terminal.move(to: NSPoint(x: 29, y: 39))
+        terminal.line(to: NSPoint(x: 37, y: 52))
+        terminal.line(to: NSPoint(x: 29, y: 65))
+        terminal.move(to: NSPoint(x: 53, y: 65))
+        terminal.line(to: NSPoint(x: 71, y: 65))
+        terminal.stroke()
+        return true
+    }
+}
+
 // MARK: - App 入口（菜单栏）
 @main
 struct KeepAliveBarApp: App {
@@ -1884,7 +1990,7 @@ struct KeepAliveBarApp: App {
         MenuBarExtra {
             ContentView().environmentObject(store)
         } label: {
-            if let img = KeepAliveBarApp.clawd {
+            if let img = store.codexFirst ? MenuBarArtwork.codex : KeepAliveBarApp.clawd {
                 Image(nsImage: img)
                 // menuTitle 为空 = 隐藏倒计时：整段 Text 都不放，避免留下一块空白间距
                 if !store.menuTitle.isEmpty { Text(store.menuTitle) }

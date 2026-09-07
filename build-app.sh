@@ -49,6 +49,7 @@ swiftc -O -parse-as-library \
 
 echo "▶ 拷贝资源（Clawd 菜单栏图标 + App 图标）"
 cp "$DIR/assets/clawd.png" "$STAGE/Contents/Resources/clawd.png"
+cp "$DIR/assets/codex.png" "$STAGE/Contents/Resources/codex.png"
 cp "$DIR/assets/AppIcon.icns" "$STAGE/Contents/Resources/AppIcon.icns"
 
 echo "▶ ad-hoc 签名"

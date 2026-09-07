@@ -29,6 +29,11 @@ struct CrossKeepaliveTests {
         check(CrossKeepalivePolicy.claudeFirst(claudeEnd: base, codexEnd: base), "tie is deterministic")
 
         let s = Store(monitoring: false)
+        check(!s.codexFirst, "fresh install keeps Claude first")
+        s.codexFirst = true
+        check(Store(monitoring: false).codexFirst, "Codex-first order survives restart")
+        s.codexFirst = false
+        check(!Store(monitoring: false).codexFirst, "Claude-first order survives restart")
         s.paused = false
         s.claudeAutoEnabled = true
         s.codexAutoEnabled = true
@@ -62,6 +67,14 @@ struct CrossKeepaliveTests {
         check(restored.crossKeepaliveEnabled && restored.crossIntervalMinutes == 120, "settings persist")
         check(restored.crossWaitUntil(claude: true) != nil, "Codex anchor survives restart")
         check(restored.crossWaitUntil(claude: false) != nil, "Claude anchor survives restart")
+        let statusStore = Store(monitoring: false)
+        statusStore.paused = false
+        statusStore.claudeAutoEnabled = true
+        statusStore.codexAutoEnabled = true
+        statusStore.crossKeepaliveEnabled = true
+        statusStore.windowEnd = current.addingTimeInterval(4 * 3600)
+        statusStore.codexPrimaryReset = current.addingTimeInterval(3 * 3600)
+        check(statusStore.crossStatus == "当前实际间隔：1h 0m", "status shows actual window-start gap")
         s.windowEnd = current.addingTimeInterval(-7200)
         s.codexPrimaryReset = current.addingTimeInterval(100)
         s.codexPrimaryReset = current.addingTimeInterval(-3600)
