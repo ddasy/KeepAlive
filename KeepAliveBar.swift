@@ -136,6 +136,29 @@ enum Shell {
     }
 }
 
+// MARK: - CrossKeepalivePolicy (pure; exercised without launching the app)
+enum CrossKeepalivePolicy {
+    static let window: TimeInterval = 5 * 3600
+
+    static func minutes(_ value: Double) -> Double {
+        value.isFinite ? min(145, max(30, value)) : 120
+    }
+
+    // 严格大于阈值：等于阈值时再等 1 秒，由现有 tick 执行。
+    static func deferredUntil(now: Date, otherStart: Date?, minutes: Double) -> Date? {
+        guard let start = otherStart, start <= now else { return nil }
+        let deadline = start.addingTimeInterval(Self.minutes(minutes) * 60 + 1)
+        return now < deadline ? deadline : nil
+    }
+
+    // 睡眠恢复/同时过期时，先到期者优先；同刻或未知时间时 Claude 优先。
+    static func claudeFirst(claudeEnd: Date?, codexEnd: Date?) -> Bool {
+        guard let c = claudeEnd, let x = codexEnd else { return true }
+        return c <= x
+    }
+}
+// MARK: - End CrossKeepalivePolicy
+
 // MARK: - 状态与调度
 @MainActor
 final class Store: ObservableObject {
@@ -168,7 +191,16 @@ final class Store: ObservableObject {
     @Published var codexAvailable = false
     @Published var codexPlan: String?
     @Published var codexPrimaryUsed: Double?
-    @Published var codexPrimaryReset: Date?
+    @Published var codexPrimaryReset: Date? {
+        didSet {
+            // nil（空闲）不能抹掉上次已确认的周期，否则重启后会丢失交叉依据。
+            if let end = codexPrimaryReset, end > Date() {
+                codexCrossWindowEnd = end
+                UserDefaults.standard.set(end.timeIntervalSince1970, forKey: "codexCrossWindowEnd")
+            }
+        }
+    }
+    private var codexCrossWindowEnd: Date?
     @Published var codexWeeklyUsed: Double?
     @Published var codexWeeklyReset: Date?
     @Published var codexSnapshotAt: Date?
@@ -188,6 +220,12 @@ final class Store: ObservableObject {
     }
     @Published var codexAutoEnabled: Bool {
         didSet { UserDefaults.standard.set(codexAutoEnabled, forKey: "codexAutoEnabled") }
+    }
+    @Published var crossKeepaliveEnabled: Bool {
+        didSet { UserDefaults.standard.set(crossKeepaliveEnabled, forKey: "crossKeepaliveEnabled") }
+    }
+    @Published var crossIntervalMinutes: Double {
+        didSet { UserDefaults.standard.set(CrossKeepalivePolicy.minutes(crossIntervalMinutes), forKey: "crossIntervalMinutes") }
     }
     @Published var launchAtLogin: Bool = false
     @Published var paused: Bool {                                 // 暂停：停止 GET 与续窗
@@ -215,6 +253,9 @@ final class Store: ObservableObject {
     private var codexNoSnapshotSince: Date?
     private var weeklyBlockLoggedAt: Date?  // Codex 周限拦截日志的节流时刻（每小时最多一条）
     private var claudeWeeklyRecheckAt: Date? // Claude 周限满时的下次联网复查时刻（稀疏复查，不再 3 分钟一轮）
+    private var lastCrossRefresh: Date?
+    private var crossRefreshing = false
+    private var lastCrossWaitLog: [String: Date] = [:]
     private var lastCodexPoll: Date?
     private var codexUsageSourceLoggedAt: Date?   // "退回 rollout" 提示的节流时刻（每小时最多一条）
     private var codexActing = false
@@ -259,11 +300,17 @@ final class Store: ObservableObject {
         return directory
     }
 
-    init() {
+    init(monitoring: Bool = true) {
         // 迁移：旧版只有一个 autoEnabled，拆分后它作为两路开关的默认值（都没写过新键时）
         let legacyAuto = (UserDefaults.standard.object(forKey: "autoEnabled") as? Bool) ?? true
         self.claudeAutoEnabled = (UserDefaults.standard.object(forKey: "claudeAutoEnabled") as? Bool) ?? legacyAuto
         self.codexAutoEnabled = (UserDefaults.standard.object(forKey: "codexAutoEnabled") as? Bool) ?? legacyAuto
+        self.crossKeepaliveEnabled = UserDefaults.standard.bool(forKey: "crossKeepaliveEnabled")
+        self.crossIntervalMinutes = CrossKeepalivePolicy.minutes(
+            (UserDefaults.standard.object(forKey: "crossIntervalMinutes") as? Double) ?? 120)
+        if let t = UserDefaults.standard.object(forKey: "codexCrossWindowEnd") as? Double {
+            self.codexCrossWindowEnd = Date(timeIntervalSince1970: t)
+        }
         self.paused = UserDefaults.standard.bool(forKey: "paused")   // 默认 false
         self.autoQueryOnOpen = (UserDefaults.standard.object(forKey: "autoQueryOnOpen") as? Bool) ?? true
         self.hideCountdown = UserDefaults.standard.bool(forKey: "hideCountdown")   // 默认 false（显示倒计时）
@@ -282,6 +329,7 @@ final class Store: ObservableObject {
         if let t = UserDefaults.standard.object(forKey: "codexNoSnapshotSince") as? Double {
             self.codexNoSnapshotSince = Date(timeIntervalSince1970: t)
         }
+        guard monitoring else { return } // 测试仅恢复状态，不启动网络、定时器或授权预热
         launchAtLogin = (SMAppService.mainApp.status == .enabled)
         let needsBootstrap = windowEnd == nil
         log("APP start (claudeAuto=\(claudeAutoEnabled) codexAuto=\(codexAutoEnabled) paused=\(paused) restoredWindowEnd=\(fmt(windowEnd))) — \(needsBootstrap ? "无窗口时间，立即拉取" : "5 分钟后首次拉取")")
@@ -309,7 +357,7 @@ final class Store: ObservableObject {
     //     那个由 `brew pin node`（冻结 node 版本、路径不再漂移）根治，不靠预热。
     // 想重新触发预热：删掉 UserDefaults 的 didWarmup 键即可。
     func warmupIfNeeded() {
-        guard !UserDefaults.standard.bool(forKey: "didWarmup") else { return }
+        guard !paused, !crossKeepaliveEnabled, !UserDefaults.standard.bool(forKey: "didWarmup") else { return }
         UserDefaults.standard.set(true, forKey: "didWarmup")   // 先落标记：即便本次失败也不反复打扰
         log("WARMUP: 首次启动 → 主动各跑一次 claude/codex，触发系统授权（钥匙串/文件访问），请在弹框点“始终允许”")
         Task { [weak self] in
@@ -324,7 +372,10 @@ final class Store: ObservableObject {
     // 否则关掉保活后菜单栏毫无痕迹，容易忘了自己按过暂停。
     var menuTitle: String {
         if paused { return "⏸" }
-        if hideCountdown { return "" }                  // 隐藏倒计时
+        if hideCountdown { return "" }
+        if let until = crossWaitUntil(claude: true), claudeIsDue {
+            return "↔ " + Store.hhmm(until.timeIntervalSince(now))
+        }
         guard let end = windowEnd else { return "–" }   // 还没见过任何活动窗口
         let rem = end.timeIntervalSince(now)
         return rem <= 0 ? "now" : Store.hhmm(rem)       // 已过末尾 → "now"（等待续窗）
@@ -344,9 +395,75 @@ final class Store: ObservableObject {
         return "\(m)m"
     }
 
+    var crossActive: Bool { crossKeepaliveEnabled && claudeAutoEnabled && codexAutoEnabled && !paused }
+    var claudeIsDue: Bool {
+        windowEnd.map { Date().timeIntervalSince($0) >= bufferSec } ?? (lastRefresh != nil && fiveReset == nil)
+    }
+    var codexIsDue: Bool {
+        codexWindowClosed || (codexPrimaryReset.map { Date().timeIntervalSince($0) >= codexBufferSec } ?? false)
+    }
+
+    func crossWaitUntil(claude: Bool) -> Date? {
+        guard crossActive else { return nil }
+        // 重置时间减 5h 是服务端周期起点；只在没有真值时用成功发送时间兜底。
+        let otherEnd = claude ? codexCrossWindowEnd : windowEnd
+        let otherFire = claude ? codexLastFire : lastFire
+        let otherStart: Date?
+        if let end = otherEnd, !(otherFire.map { $0 > end } ?? false) {
+            otherStart = end.addingTimeInterval(-CrossKeepalivePolicy.window)
+        } else {
+            otherStart = otherFire
+        }
+        return CrossKeepalivePolicy.deferredUntil(now: Date(), otherStart: otherStart, minutes: crossIntervalMinutes)
+    }
+
+    func crossAllowsFire(claude: Bool) -> Bool {
+        guard let until = crossWaitUntil(claude: claude) else { return true }
+        let who = claude ? "Claude" : "Codex"
+        if lastCrossWaitLog[who] != until {
+            lastCrossWaitLog[who] = until
+            log("CROSS \(who) 交叉保活：延后至 \(fmt(until))，间隔须大于 \(Int(crossIntervalMinutes)) 分钟")
+        }
+        return false
+    }
+
+    // 失败重试中的一方不占优先权，避免另一方一直饿死。
+    func crossYieldsPriority(claude: Bool) -> Bool {
+        guard crossActive, claudeIsDue, codexIsDue else { return false }
+        let otherAttempt = claude ? codexLastAttempt : lastAttempt
+        if let attempt = otherAttempt, Date().timeIntervalSince(attempt) < retryIntervalSec { return false }
+        if claude ? codexWeeklyBlocked : claudeWeeklyBlocked { return false }
+        let first = CrossKeepalivePolicy.claudeFirst(claudeEnd: windowEnd, codexEnd: codexPrimaryReset ?? codexCrossWindowEnd)
+        return claude != first
+    }
+
+    var crossStatus: String {
+        if paused { return "已暂停交叉调度" }
+        if !claudeAutoEnabled || !codexAutoEnabled { return "同时开启两侧保活后生效" }
+        if claudeIsDue, let until = crossWaitUntil(claude: true) {
+            return "Claude 交叉等待至 \(localMDHM(until))"
+        }
+        if codexIsDue, let until = crossWaitUntil(claude: false) {
+            return "Codex 交叉等待至 \(localMDHM(until))"
+        }
+        return "间隔足够时正常保活；过近时延后"
+    }
+
     func tick() {
         guard !paused else { return }   // 暂停：不倒计时、不联网、不续窗
         now = Date()   // 本地倒计时（不联网）
+        // 交叉模式需周期性读两边真值，识别用户在等待期间自行开启的新窗口。
+        if crossActive, !crossRefreshing,
+           lastCrossRefresh.map({ now.timeIntervalSince($0) >= 300 }) ?? true {
+            crossRefreshing = true
+            lastCrossRefresh = now
+            Task {
+                await refresh()
+                crossRefreshing = false
+                maybeAct()
+                maybeActCodex()
+            }
+        }
         maybeAct()     // 只有到点了才会去联网确认并续窗
         // Codex 用量默认每 5 分钟查一次。但 Codex 的窗口是从**消息时刻**起算的
         //（Claude 是按半点对齐，03:31 发的消息落进 03:30–08:30，早发晚发不亏），
@@ -356,6 +473,7 @@ final class Store: ObservableObject {
         // 收紧只在真正等着开窗时生效：关掉 Codex 保活、周限已满、或正在开火时都不收紧，
         // 免得在"永远不会开火"的状态里 20s 一次空转（wham/usage 免费，但没必要）。
         let codexDue = codexAutoEnabled && !codexWeeklyBlocked && !codexActing
+            && crossWaitUntil(claude: false) == nil
             && ((codexPrimaryReset.map { now >= $0 } ?? false) || codexWindowClosed)
         let codexPollInterval: TimeInterval = codexDue ? 20 : 300
         if lastCodexPoll == nil || now.timeIntervalSince(lastCodexPoll!) >= codexPollInterval {
@@ -553,7 +671,8 @@ final class Store: ObservableObject {
     // 接口查询成功但没有活动 5h 窗口、且本地也没有可恢复的 windowEnd：
     // 用一条 Haiku 消息激活窗口。lastAttempt/lastFire 防止接口数据传播延迟造成重复发送。
     func maybeBootstrapMissingWindow() {
-        guard claudeAutoEnabled, !paused, windowEnd == nil, !busyFiring, !acting else { return }
+        guard claudeAutoEnabled, !paused, windowEnd == nil, !busyFiring, !acting, !codexActing else { return }
+        guard !crossYieldsPriority(claude: true), crossAllowsFire(claude: true) else { return }
         if claudeWeeklyBlocked {
             log("BOOTSTRAP skip: Claude 周限 \(pctStr(sevenPct)) 已用尽（重置 \(fmt(sevenReset))）")
             return
@@ -568,7 +687,7 @@ final class Store: ObservableObject {
     func refresh() async {
         cancelRefreshRetry()
         await readCodexUsage()          // Codex：本地读文件，不联网/不耗额度 → 不受暂停影响
-        maybeActCodex()
+        if !crossActive { maybeActCodex() }
         guard !paused else { return }   // 暂停：仅停止 Claude 的 GET 与续窗（不影响上面的 Codex）
         guard await proxyEnabled() else {   // 前置条件：代理未开则跳过用量刷新（Codex 已在上方读完）
             lastError = "代理未开启，已跳过用量刷新"
@@ -644,6 +763,7 @@ final class Store: ObservableObject {
                 if hasActiveWindow { windowEnd = fiveReset }
                 // 关键诊断日志：原始 resets_at / 用量 / is_active 全记下——下次窗口过期时这行会揭示接口的真实返回
                 log("REFRESH ok five=\(pctStr(fivePct)) rawReset=\(fmt(fiveReset)) tokenExp=\(tokExp) sessionActive=\(boolStr(sessionActive)) → windowEnd=\(fmt(windowEnd)) (active=\(hasActiveWindow))")
+                if crossActive { maybeActCodex() }
                 if windowEnd == nil, claudeAutoEnabled {
                     // 服务端已明确当前没有活动窗口。立即尝试激活，并持续重查直到拿到新 reset。
                     scheduleRefreshRetry("查询成功但 five_hour.resets_at=nil")
@@ -814,7 +934,7 @@ final class Store: ObservableObject {
     // Codex 没有公开 usage 查询接口：有本地 reset 就按 reset 续窗；没有时间时，
     // 首次观察开始计时，连续 5 小时后发送一次 Reply OK 激活，随后等待新的 rollout 快照。
     func maybeActCodex() {
-        guard codexAutoEnabled, !paused, !busyFiring, !acting, !codexActing else { return }
+        guard codexAutoEnabled, !paused, !busyFiring, !acting, !codexActing, !crossRefreshing else { return }
         // 周限剩余 0 → 本周不再触发 5h 保活，等越过周重置时刻自动恢复
         if codexWeeklyBlocked {
             if weeklyBlockLoggedAt == nil || Date().timeIntervalSince(weeklyBlockLoggedAt!) >= 3600 {
@@ -846,16 +966,23 @@ final class Store: ObservableObject {
             }
             ready = current.timeIntervalSince(codexNoSnapshotSince!) >= codexFallbackSec
         }
-        guard ready else { return }
+        guard ready, !crossYieldsPriority(claude: false), crossAllowsFire(claude: false) else { return }
         if let attempt = codexLastAttempt, current.timeIntervalSince(attempt) < codexRetryIntervalSec { return }
         if let fire = codexLastFire, current.timeIntervalSince(fire) < codexMinRefireSec { return }
         Task { await fireCodex() }
     }
 
     func fireCodex() async {
-        guard !codexActing else { return }
+        guard codexAutoEnabled, !paused, !codexActing, !acting, !busyFiring else { return }
         codexActing = true
         defer { codexActing = false }
+        if crossActive {
+            // 锁先于 await，避免 Claude/Codex 两个 Task 同时发出请求。
+            await refresh()
+            if !codexWindowClosed, let end = codexPrimaryReset, end > Date() { return }
+        }
+        guard codexAutoEnabled, !paused, !codexWeeklyBlocked, !crossYieldsPriority(claude: false),
+              crossAllowsFire(claude: false) else { return }
         let attempt = Date()
         codexLastAttempt = attempt
         UserDefaults.standard.set(attempt.timeIntervalSince1970, forKey: "codexLastAttempt")
@@ -991,7 +1118,7 @@ final class Store: ObservableObject {
     // 用粘滞的 windowEnd 而非原始 fiveReset：即使接口在过期后把 resets_at 变 null / 未来，
     // windowEnd 仍指向旧窗口末尾（已过去）→ 能持续触发续窗与退避重试，不会像旧代码那样卡死。
     func maybeAct() {
-        guard claudeAutoEnabled, !busyFiring, !acting else { return }
+        guard claudeAutoEnabled, !paused, !busyFiring, !acting, !codexActing, !crossRefreshing else { return }
         let now = Date()
         // 距上次“尝试”不足 retryIntervalSec 则不动（失败/未续窗时按此退避重试）
         if let la = lastAttempt, now.timeIntervalSince(la) < retryIntervalSec { return }
@@ -999,6 +1126,7 @@ final class Store: ObservableObject {
         // 周限已满：不必每 3 分钟联网撞一次墙，按 claudeWeeklyRecheckAt 稀疏复查（见 handleWindowClosed）
         if claudeWeeklyBlocked, let until = claudeWeeklyRecheckAt, now < until { return }
         if now.timeIntervalSince(end) >= bufferSec { // 本地倒计时已过窗口末尾 → 该确认并续窗
+            guard !crossYieldsPriority(claude: true), crossAllowsFire(claude: true) else { return }
             log("maybeAct → handleWindowClosed (windowEnd=\(fmt(end)) 已过 \(Int(now.timeIntervalSince(end)))s)")
             Task { await handleWindowClosed() }
         }
@@ -1009,7 +1137,7 @@ final class Store: ObservableObject {
     // 这只可能是用户自己开了新窗、或我们上次 fire 已成功。此时无需再发。
     // 否则 windowEnd 仍是过去（旧窗口已关且没新窗口）→ 续窗。这样不依赖 is_active，也不会误判活动期。
     func handleWindowClosed() async {
-        guard !acting, !busyFiring else { return }
+        guard claudeAutoEnabled, !paused, !acting, !busyFiring, !codexActing else { return }
         acting = true
         defer { acting = false }
         guard await proxyEnabled() else {   // 前置条件：代理未开则跳过本次续窗
@@ -1036,7 +1164,8 @@ final class Store: ObservableObject {
     }
 
     func fire() async {
-        if busyFiring { return }
+        guard claudeAutoEnabled, !paused, !busyFiring, !codexActing,
+              !crossYieldsPriority(claude: true), crossAllowsFire(claude: true) else { return }
         busyFiring = true
         defer { busyFiring = false }
         lastAttempt = Date()   // 记录尝试时刻（成功/失败都算）→ 失败后按 retryIntervalSec 退避重试
@@ -1448,6 +1577,47 @@ struct ControlSections: View {
                 HStack(spacing: 8) {
                     KeepAliveToggleCard(title: "Claude", mark: "C", isOn: $s.claudeAutoEnabled)
                     KeepAliveToggleCard(title: "Codex", mark: ">_", isOn: $s.codexAutoEnabled)
+                }
+                HStack(spacing: 10) {
+                    Text("交叉保活").font(.caption)
+                    Spacer(minLength: 0)
+                    Menu {
+                        ForEach(Array(stride(from: 30, through: 145, by: 5)), id: \.self) { minutes in
+                            Button {
+                                s.crossIntervalMinutes = Double(minutes)
+                            } label: {
+                                if Int(s.crossIntervalMinutes) == minutes {
+                                    Label("\(minutes) 分钟", systemImage: "checkmark")
+                                } else {
+                                    Text("\(minutes) 分钟")
+                                }
+                            }
+                        }
+                    } label: {
+                        Text("间隔＞\(Int(s.crossIntervalMinutes)) 分钟").font(.caption)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .accessibilityLabel("交叉保活间隔")
+                    .accessibilityValue("大于 \(Int(s.crossIntervalMinutes)) 分钟")
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.16)) {
+                            s.crossKeepaliveEnabled.toggle()
+                        }
+                    } label: {
+                        ToggleCheckmark(isOn: s.crossKeepaliveEnabled, compact: true)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("交叉保活")
+                    .accessibilityValue(s.crossKeepaliveEnabled ? "已开启" : "已关闭")
+                }
+                .padding(.horizontal, 11)
+                .frame(height: 42)
+                .background(s.crossKeepaliveEnabled ? Color.accentColor.opacity(0.055) : Color.clear)
+                if s.crossKeepaliveEnabled {
+                    Text(s.crossStatus)
+                        .font(.caption2).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
 
