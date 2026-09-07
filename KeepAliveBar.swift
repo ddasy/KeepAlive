@@ -26,7 +26,7 @@ struct CodexRollout: Decodable {
     struct Payload: Decodable {
         struct RL: Decodable {
             // ⚠️ primary/secondary 槽位并非固定对应 5h/周——要看 window_minutes 判定：
-            // window_minutes≈300 → 5 小时窗口；≈10080 → 7 天(周)窗口。空闲(仅 hi 保活)的快照往往
+            // window_minutes≈300 → 5 小时窗口；≈10080 → 7 天(周)窗口。空闲（仅 Reply OK 保活）的快照往往
             // 只带一个“周”窗口且放在 primary、secondary 缺失、5h 窗口整段消失。切勿按槽位当 5h/周。
             struct Bucket: Decodable { let used_percent: Double?; let resets_at: Double?; let window_minutes: Double? }
             let primary: Bucket?
@@ -37,6 +37,23 @@ struct CodexRollout: Decodable {
     }
     let timestamp: String?
     let payload: Payload?
+}
+
+// Codex 实时用量（GET https://chatgpt.com/backend-api/wham/usage）——Codex 版的 /api/oauth/usage。
+// 服务端真值、免费、不需要 codex 跑过，取代"扫 rollout 日志找最后一条 rate_limits"那套启发式。
+struct CodexWhamUsage: Decodable {
+    struct RateLimit: Decodable {
+        struct Window: Decodable {
+            let used_percent: Double?
+            let limit_window_seconds: Double?
+            let reset_after_seconds: Double?
+            let reset_at: Double?
+        }
+        let primary_window: Window?     // 5 小时窗口
+        let secondary_window: Window?   // 周窗口
+    }
+    let plan_type: String?
+    let rate_limit: RateLimit?
 }
 
 func parseISO(_ s: String?) -> Date? {
@@ -155,6 +172,9 @@ final class Store: ObservableObject {
     @Published var codexWeeklyUsed: Double?
     @Published var codexWeeklyReset: Date?
     @Published var codexSnapshotAt: Date?
+    // 服务端明确"当前没有活动 5h 窗口"。只由 wham/usage 置位（本地 rollout 日志区分不出
+    // "窗口关着"和"没记录"，那条路走时间兜底）。为 true 时该立刻开火，而不是等 codexPrimaryReset。
+    @Published var codexWindowClosed = false
     @Published var codexLastFire: Date?
     @Published var codexLastFireResult: String = ""
     @Published var lastError: String?
@@ -196,6 +216,7 @@ final class Store: ObservableObject {
     private var weeklyBlockLoggedAt: Date?  // Codex 周限拦截日志的节流时刻（每小时最多一条）
     private var claudeWeeklyRecheckAt: Date? // Claude 周限满时的下次联网复查时刻（稀疏复查，不再 3 分钟一轮）
     private var lastCodexPoll: Date?
+    private var codexUsageSourceLoggedAt: Date?   // "退回 rollout" 提示的节流时刻（每小时最多一条）
     private var codexActing = false
     private var refreshRetryTask: Task<Void, Never>?
     private var refreshRetryFailures = 0     // 连续失败次数 → scheduleRefreshRetry 的指数退避指数（成功即清零）
@@ -203,12 +224,40 @@ final class Store: ObservableObject {
     let keychainService = "Claude Code-credentials"
     let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
 
+    // ---- 直连保活 ----------------------------------------------------------
+    // 保活只需要"一条计费到订阅的推理请求"。CLI 会额外背上工具定义、系统提示词、全局
+    // CLAUDE.md/AGENTS.md、skills 清单——对"开窗"毫无贡献，却占了 99.9% 的 token。
+    // 实测（2026-09-06，同机同账号）：
+    //   claude -p 'Reply OK' --model haiku    → 22,698 in / 51 out
+    //   直连 POST /v1/messages                →      8 in /  1 out
+    //   codex exec 'Reply OK'                 → 13,871 in / 16 out
+    //   直连 POST .../codex/responses         →     14 in / 16 out
+    // Codex 侧已实证：一条 30 token 的裸 HTTP 请求确实开出完整的新 5 小时窗口。
+    // **没有自动降级**：直连失败或"发了但没开出窗口"时会明确报错并按原节奏重试，
+    // 好让问题第一时间暴露，而不是被 CLI 补发掩盖成"一切正常"。
+    // 想整体退回 CLI 写法：UserDefaults 里把 directFire 设为 false（无 UI 开关，调试用）。
+    let claudeAPIURL = URL(string: "https://api.anthropic.com/v1/messages")!
+    let claudeAPIModel = "claude-haiku-4-5-20251001"   // CLI 收别名(haiku)，HTTP 要完整 id
+    let codexResponsesURL = URL(string: "https://chatgpt.com/backend-api/codex/responses")!
+    let codexUsageURL = URL(string: "https://chatgpt.com/backend-api/wham/usage")!
+    var directFireEnabled: Bool {
+        (UserDefaults.standard.object(forKey: "directFire") as? Bool) ?? true
+    }
+
     private var tickTimer: Timer?
     private var acting = false   // 正在处理“窗口关闭”（联网确认+续窗），防重入
 
     var home: String { NSHomeDirectory() }
     var supportDir: String { "\(NSHomeDirectory())/Library/Application Support/KeepAliveBar" }
-    var workdir: String { "\(supportDir)/null" }
+
+    // 每次保活使用一个全新的系统临时目录。命令结束后由调用方立即删除，避免留下
+    // 任何项目文件、CLAUDE.md、git 元数据或历史保活目录可被下一次命令读取。
+    func makeTemporaryKeepaliveDirectory() throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("KeepAliveBar-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        return directory
+    }
 
     init() {
         // 迁移：旧版只有一个 autoEnabled，拆分后它作为两路开关的默认值（都没写过新键时）
@@ -233,7 +282,6 @@ final class Store: ObservableObject {
         if let t = UserDefaults.standard.object(forKey: "codexNoSnapshotSince") as? Double {
             self.codexNoSnapshotSince = Date(timeIntervalSince1970: t)
         }
-        try? FileManager.default.createDirectory(atPath: workdir, withIntermediateDirectories: true)
         launchAtLogin = (SMAppService.mainApp.status == .enabled)
         let needsBootstrap = windowEnd == nil
         log("APP start (claudeAuto=\(claudeAutoEnabled) codexAuto=\(codexAutoEnabled) paused=\(paused) restoredWindowEnd=\(fmt(windowEnd))) — \(needsBootstrap ? "无窗口时间，立即拉取" : "5 分钟后首次拉取")")
@@ -300,8 +348,17 @@ final class Store: ObservableObject {
         guard !paused else { return }   // 暂停：不倒计时、不联网、不续窗
         now = Date()   // 本地倒计时（不联网）
         maybeAct()     // 只有到点了才会去联网确认并续窗
-        // Codex 的 reset 来自本地 rollout 快照，每 5 分钟读一次；没有快照时也由这里累计 5 小时。
-        if lastCodexPoll == nil || now.timeIntervalSince(lastCodexPoll!) >= 300 {
+        // Codex 用量默认每 5 分钟查一次。但 Codex 的窗口是从**消息时刻**起算的
+        //（Claude 是按半点对齐，03:31 发的消息落进 03:30–08:30，早发晚发不亏），
+        // 所以 Codex 这边晚发一秒就真少一秒：实测 04:13:43 重置、5 分钟节奏到 04:17:03 才发现，
+        // 这一轮白丢 3 分 23 秒。于是"已知窗口到点 / 服务端说没窗口"时把间隔收紧到 20s，
+        // 平均损耗从 ~2.5 分钟降到 ~10 秒。开火成功后 reset 回到未来 → 自动恢复 300s 节奏。
+        // 收紧只在真正等着开窗时生效：关掉 Codex 保活、周限已满、或正在开火时都不收紧，
+        // 免得在"永远不会开火"的状态里 20s 一次空转（wham/usage 免费，但没必要）。
+        let codexDue = codexAutoEnabled && !codexWeeklyBlocked && !codexActing
+            && ((codexPrimaryReset.map { now >= $0 } ?? false) || codexWindowClosed)
+        let codexPollInterval: TimeInterval = codexDue ? 20 : 300
+        if lastCodexPoll == nil || now.timeIntervalSince(lastCodexPoll!) >= codexPollInterval {
             lastCodexPoll = now
             Task { [weak self] in
                 guard let self else { return }
@@ -504,7 +561,7 @@ final class Store: ObservableObject {
         let current = Date()
         let mostRecent = [lastAttempt, lastFire].compactMap { $0 }.max()
         if let recent = mostRecent, current.timeIntervalSince(recent) < retryIntervalSec { return }
-        log("BOOTSTRAP: usage 查询成功但 windowEnd=nil → 用 Haiku 发送 hi 激活 5 小时窗口")
+        log("BOOTSTRAP: usage 查询成功但 windowEnd=nil → 用 Haiku 发送 Reply OK 激活 5 小时窗口")
         Task { await fire() }
     }
 
@@ -613,6 +670,76 @@ final class Store: ObservableObject {
     // “上次 fire + 5h”（可能远在过去）→ 保活提前开火、每 3 分钟撞一次 429，直到真实重置时刻。
     // 所以这里取多条候选行、丢掉两个桶全空的，再按时间戳分别挑最新的 5h / 周窗口。
     func readCodexUsage() async {
+        if directFireEnabled, await readCodexUsageRemote() { return }
+        if directFireEnabled {
+            // wham/usage 不可达（离线/代理未开/登录态失效）→ 退回扫本地 rollout。
+            // 每小时最多记一条，别把日志刷满。
+            if codexUsageSourceLoggedAt == nil
+                || Date().timeIntervalSince(codexUsageSourceLoggedAt!) >= 3600 {
+                codexUsageSourceLoggedAt = Date()
+                log("CODEX usage: wham/usage 不可达 → 退回本地 rollout 快照")
+            }
+        }
+        await readCodexUsageRollout()
+    }
+
+    // ~/.codex/auth.json 里的 ChatGPT 登录态（codex CLI 自己维护、自己轮换）。这里只读不写：
+    // token 过期 → 直连 401 → 回落 CLI，CLI 会顺手把 auth.json 刷新好，下次直连又能用。
+    struct CodexAuth { let token: String; let account: String }
+    func codexAuth() -> CodexAuth? {
+        guard let d = FileManager.default.contents(atPath: "\(home)/.codex/auth.json"),
+              let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+              let t = obj["tokens"] as? [String: Any],
+              let tok = t["access_token"] as? String, !tok.isEmpty,
+              let acc = t["account_id"] as? String, !acc.isEmpty else { return nil }
+        return CodexAuth(token: tok, account: acc)
+    }
+
+    // 查 wham/usage 拿实时窗口状态。成功返回 true（调用方就不再去扫 rollout 日志了）。
+    //
+    // ⚠️ 关键语义：**空闲时 primary_window.reset_at 是滚动的"此刻 + 窗口长度"**，
+    //    并不代表有一个已锚定的窗口。实测（2026-09-06 23:13）：窗口刚重置且零用量时，
+    //    两次读数 reset_after_seconds 都恰好是 18000；发出一条请求后立刻变成 17991 → 17972，
+    //    而 reset_at 的绝对值固定不动 —— 窗口被锚定在了那条请求的时刻。
+    //    所以判据是 reset_after_seconds 是否已明显小于窗口总长：
+    //      reset_after < limit_window - 5  → 有活动窗口，reset_at 可信
+    //      否则                            → 当前无活动窗口（codexWindowClosed=true，该开火）
+    //    若把滚动值当成"窗口开着"，保活将永远不触发 —— 这是这里最容易踩的坑。
+    func readCodexUsageRemote() async -> Bool {
+        guard let auth = codexAuth() else { return false }
+        var req = URLRequest(url: codexUsageURL)
+        req.setValue("Bearer \(auth.token)", forHTTPHeaderField: "Authorization")
+        req.setValue(auth.account, forHTTPHeaderField: "chatgpt-account-id")
+        req.setValue("codex_cli_rs", forHTTPHeaderField: "originator")
+        req.timeoutInterval = 20
+        guard let pair = try? await URLSession.shared.data(for: req),
+              (pair.1 as? HTTPURLResponse)?.statusCode == 200,
+              let u = try? JSONDecoder().decode(CodexWhamUsage.self, from: pair.0),
+              let rl = u.rate_limit else { return false }
+
+        codexAvailable = true
+        codexPlan = u.plan_type
+        codexSnapshotAt = Date()
+        if let p = rl.primary_window, let after = p.reset_after_seconds, let win = p.limit_window_seconds {
+            let anchored = after < win - 5
+            if codexWindowClosed == anchored {   // 状态翻转才记一条：窗口开/关是稀有事件，值得留痕
+                log("CODEX window \(anchored ? "OPEN" : "CLOSED") (via wham/usage, reset_after=\(Int(after))s/\(Int(win))s)")
+            }
+            codexWindowClosed = !anchored
+            codexPrimaryUsed = anchored ? p.used_percent : 0
+            codexPrimaryReset = anchored ? p.reset_at.map { Date(timeIntervalSince1970: $0) } : nil
+        } else {
+            codexWindowClosed = false     // 结构不认识 → 当作未知，别据此开火
+            codexPrimaryUsed = nil
+            codexPrimaryReset = nil
+        }
+        codexWeeklyUsed = rl.secondary_window?.used_percent
+        codexWeeklyReset = rl.secondary_window?.reset_at.map { Date(timeIntervalSince1970: $0) }
+        return true
+    }
+
+    func readCodexUsageRollout() async {
+        codexWindowClosed = false        // 本地日志区分不出"窗口关着"，一律当未知
         let env = baseEnv()
         // 每个文件取最后 3 条 rate_limits（足以越过尾部的 premium 空记录），最多凑 3 个有产出的文件。
         let cmd = "n=0; for f in $(ls -t \"$HOME\"/.codex/sessions/*/*/*/rollout-*.jsonl 2>/dev/null | head -12); do " +
@@ -668,7 +795,7 @@ final class Store: ObservableObject {
             five = newest.rl.primary; weekly = newest.rl.secondary
         }
         // 5h 窗口：优先用快照里真正的 5h 窗口(通常只在有实际用量的会话里出现)；
-        // 保活 hi 的快照往往只带“周”窗口、没有 5h 窗口 → 用“上次 fire + 5h”估算 5h 重置，
+        // 保活 Reply OK 的快照往往只带“周”窗口、没有 5h 窗口 → 用“上次 fire + 5h”估算 5h 重置，
         // 既给出倒计时、又驱动在 fire 后约 5h 精确续窗，绝不把周 reset 误当 5h reset。
         if let five = five, let ra = five.resets_at {
             codexPrimaryUsed = five.used_percent
@@ -685,7 +812,7 @@ final class Store: ObservableObject {
     }
 
     // Codex 没有公开 usage 查询接口：有本地 reset 就按 reset 续窗；没有时间时，
-    // 首次观察开始计时，连续 5 小时后发送一次 hi 激活，随后等待新的 rollout 快照。
+    // 首次观察开始计时，连续 5 小时后发送一次 Reply OK 激活，随后等待新的 rollout 快照。
     func maybeActCodex() {
         guard codexAutoEnabled, !paused, !busyFiring, !acting, !codexActing else { return }
         // 周限剩余 0 → 本周不再触发 5h 保活，等越过周重置时刻自动恢复
@@ -697,14 +824,19 @@ final class Store: ObservableObject {
             return
         }
         let current = Date()
-        if let reset = codexPrimaryReset, reset.timeIntervalSince(current) > codexBufferSec {
+        if !codexWindowClosed, let reset = codexPrimaryReset, reset.timeIntervalSince(current) > codexBufferSec {
             codexNoSnapshotSince = nil
             UserDefaults.standard.removeObject(forKey: "codexNoSnapshotSince")
             return
         }
 
         var ready = false
-        if let reset = codexPrimaryReset {
+        if codexWindowClosed {
+            // 服务端明确当前没有活动 5h 窗口 → 立刻开火，不必再走"连续 5 小时"的时间兜底
+            codexNoSnapshotSince = nil
+            UserDefaults.standard.removeObject(forKey: "codexNoSnapshotSince")
+            ready = true
+        } else if let reset = codexPrimaryReset {
             ready = current.timeIntervalSince(reset) >= codexBufferSec
         } else {
             if codexNoSnapshotSince == nil {
@@ -727,8 +859,90 @@ final class Store: ObservableObject {
         let attempt = Date()
         codexLastAttempt = attempt
         UserDefaults.standard.set(attempt.timeIntervalSince1970, forKey: "codexLastAttempt")
-        log("CODEX FIRE start: codex exec 'hi' --model gpt-5.4-mini --effort low")
-        try? FileManager.default.createDirectory(atPath: workdir, withIntermediateDirectories: true)
+        if directFireEnabled { _ = await fireCodexDirect() } else { await fireCodexCLI() }
+    }
+
+    // 直连一条最小推理请求开窗（实测 14 in / 16 out，CLI 是 13,871 / 16）。
+    // 请求体与 codex CLI 发的完全同构，只是 tools=[]、instructions 换成一句话。
+    // 与 Claude 侧一样**不做自动降级**（见 fireDirect 注释）。注意 codex 的 token 由 CLI 维护，
+    // 过期后直连会 401；因为不再自动回落 CLI，也就不会顺手把 auth.json 刷新好 —— 401 会持续
+    // 刷日志直到你自己跑一次 codex 或重新登录。这是刻意的：宁可吵，也不要"看起来正常"。
+    func fireCodexDirect() async -> Bool {
+        guard let auth = codexAuth() else {
+            codexLastFireResult = "Codex 保活失败：~/.codex/auth.json 无可用登录态"
+            log("CODEX FIRE direct 失败：~/.codex/auth.json 无可用登录态 —— 窗口未续")
+            return false
+        }
+        var req = URLRequest(url: codexResponsesURL)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(auth.token)", forHTTPHeaderField: "Authorization")
+        req.setValue(auth.account, forHTTPHeaderField: "chatgpt-account-id")
+        req.setValue("responses=experimental", forHTTPHeaderField: "OpenAI-Beta")
+        req.setValue("codex_cli_rs", forHTTPHeaderField: "originator")
+        req.setValue(UUID().uuidString, forHTTPHeaderField: "session_id")
+        req.setValue("application/json", forHTTPHeaderField: "content-type")
+        req.setValue("text/event-stream", forHTTPHeaderField: "accept")
+        req.timeoutInterval = 60
+        let body: [String: Any] = [
+            "model": "gpt-5.4-mini",
+            "instructions": "Reply OK.",
+            "input": [["type": "message", "role": "user",
+                       "content": [["type": "input_text", "text": "hi"]]]],
+            "tools": [], "tool_choice": "auto", "parallel_tool_calls": false,
+            "reasoning": ["effort": "low", "summary": "auto"],
+            "store": false, "stream": true, "include": []
+        ]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+            guard code == 200 else {
+                let b = (String(data: data, encoding: .utf8) ?? "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let mins = Int(codexRetryIntervalSec / 60)
+                codexLastFireResult = "Codex 保活失败：直连 HTTP \(code)，约 \(mins) 分钟后重试"
+                log("CODEX FIRE direct HTTP \(code) —— 窗口未续（401 多半是登录态过期，跑一次 codex 或重新登录）: \(String(b.prefix(160)))")
+                return false
+            }
+        } catch {
+            let ns = error as NSError
+            let mins = Int(codexRetryIntervalSec / 60)
+            codexLastFireResult = "Codex 保活失败：\(error.localizedDescription)，约 \(mins) 分钟后重试"
+            log("CODEX FIRE direct failed: \(ns.domain)#\(ns.code) \(error.localizedDescription) —— 窗口未续")
+            return false
+        }
+        // 自证同样轮询等待。第一次 sleep 还兼作"让 reset_after 明显偏离窗口总长"，好判定锚定
+        //（见 readCodexUsageRemote 注释）。wham/usage 实测比 Claude 的 usage 快得多，但仍留重试余量。
+        var reset: Date?
+        for wait in [8, 15, 30] as [UInt64] {
+            try? await Task.sleep(nanoseconds: wait * 1_000_000_000)
+            if await readCodexUsageRemote(), !codexWindowClosed, let r = codexPrimaryReset { reset = r; break }
+        }
+        guard let reset else {
+            codexLastFireResult = "⚠️ Codex 直连 HTTP 200 但 53s 内未见新窗口 —— 直连开窗可能已失效"
+            log("CODEX FIRE direct HTTP 200 但 53s 内未见新窗口（closed=\(codexWindowClosed)）—— 直连开窗可能已失效，需要人工判断；临时退回：defaults write com.iu.keepalivebar directFire -bool false")
+            return false
+        }
+        let stamp = Date()
+        codexLastFire = stamp
+        UserDefaults.standard.set(stamp.timeIntervalSince1970, forKey: "codexLastFire")
+        codexLastFireResult = "Codex 激活成功（直连，~30 tokens）：新窗口 \(fmt(reset)) 重置"
+        log("CODEX FIRED direct -> 新窗口 reset=\(fmt(reset))")
+        return true
+    }
+
+    func fireCodexCLI() async {
+        log("CODEX FIRE start: codex exec 'Reply OK' --model gpt-5.4-mini --effort low")
+        let temporaryDirectory: URL
+        do {
+            temporaryDirectory = try makeTemporaryKeepaliveDirectory()
+        } catch {
+            codexLastFireResult = "Codex 保活失败：无法创建临时目录（\(error.localizedDescription)）"
+            log("CODEX FAILED: 无法创建临时目录：\(error.localizedDescription)")
+            return
+        }
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+        let temporaryPath = temporaryDirectory.path
 
         let env = baseEnv()
         let command = keepaliveCodexUsesEnv ? "/usr/bin/env" : keepaliveCodexBin
@@ -748,9 +962,9 @@ final class Store: ObservableObject {
             "-c", "model_providers.chatgpt-httponly.wire_api=responses",
             "-c", "model_providers.chatgpt-httponly.requires_openai_auth=true",
             "-c", "model_providers.chatgpt-httponly.supports_websockets=false",
-            "--cd", workdir,
+            "--cd", temporaryPath,
             "--skip-git-repo-check", "--ignore-user-config", "--ignore-rules",
-            "--sandbox", "read-only", "hi"
+            "--sandbox", "read-only", "Reply OK"
         ]
         var cleanEnv = env
         cleanEnv.removeValue(forKey: "OPENAI_API_KEY")
@@ -826,14 +1040,102 @@ final class Store: ObservableObject {
         busyFiring = true
         defer { busyFiring = false }
         lastAttempt = Date()   // 记录尝试时刻（成功/失败都算）→ 失败后按 retryIntervalSec 退避重试
-        log("FIRE start: claude -p 'hi' --model haiku（脱钩：子进程自负钥匙串责任，避免弹授权框）")
-        try? FileManager.default.createDirectory(atPath: workdir, withIntermediateDirectories: true)
-        let env = baseEnv(); let wd = workdir; let bin = keepaliveClaudeBin
+        if directFireEnabled { _ = await fireDirect() } else { await fireCLI() }
+    }
+
+    // 直连一条最小推理请求开窗（实测 8 in / 1 out，claude -p 是 22,698 / 51）。
+    // 用的就是钥匙串里那张订阅 OAuth token（与查 usage 同一张），因此和 claude -p 一样
+    // 计入订阅的 5h/周限额 —— 省掉的只是工具定义、系统提示词和全局 CLAUDE.md。
+    //
+    // **故意不做自动降级**：直连一旦失效，就让它明明白白地失败、按 retryIntervalSec 每 3 分钟
+    // 重试并刷一条日志，而不是被 CLI 悄悄补上导致"看起来一切正常、其实早已回到 22,698 tokens"。
+    // 自证是让问题显形的关键一步：即便 HTTP 200，也要回读 usage 确认 five_hour.resets_at
+    // 真的落到了未来（= 新窗口已开），没开出来照样算失败。
+    // 要手动退回旧写法：UserDefaults 的 directFire 设为 false（显式开关，不是自动降级）。
+    func fireDirect() async -> Bool {
+        var cred = await readCredential()
+        // 与 refresh() 同样的策略：token 快过期先换一张，别发一发注定 401 的请求。
+        if tokenNeedsRefresh(cred.expiresAtMs), await refreshOAuthToken(cred) {
+            cred = await readCredential()
+        }
+        guard let tok = cred.accessToken, !tokenNeedsRefresh(cred.expiresAtMs) else {
+            lastFireResult = "保活失败：无可用 token（\(cred.diag)），需重新登录 claude"
+            log("FIRE direct 失败：无可用 token（\(cred.diag)）—— 窗口未续")
+            return false
+        }
+        var req = URLRequest(url: claudeAPIURL)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(tok)", forHTTPHeaderField: "Authorization")
+        req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        req.setValue("application/json", forHTTPHeaderField: "content-type")
+        req.setValue("cli", forHTTPHeaderField: "x-app")
+        req.setValue("claude-cli/2.1 (external, cli)", forHTTPHeaderField: "User-Agent")
+        req.timeoutInterval = 30
+        req.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "model": claudeAPIModel, "max_tokens": 1,
+            "messages": [["role": "user", "content": "."]]
+        ])
+        log("FIRE start: 直连 POST /v1/messages (\(claudeAPIModel), max_tokens=1)")
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+            guard code == 200 else {
+                let b = (String(data: data, encoding: .utf8) ?? "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let mins = Int(retryIntervalSec / 60)
+                lastFireResult = "保活失败：直连 HTTP \(code)，约 \(mins) 分钟后重试"
+                log("FIRE direct HTTP \(code) tokenExp=\(tokenExpStr(cred.expiresAtMs)) —— 窗口未续: \(String(b.prefix(160)))")
+                return false
+            }
+        } catch {
+            let ns = error as NSError
+            let mins = Int(retryIntervalSec / 60)
+            lastFireResult = "保活失败：\(error.localizedDescription)，约 \(mins) 分钟后重试"
+            log("FIRE direct failed: \(ns.domain)#\(ns.code) \(error.localizedDescription) —— 窗口未续")
+            return false
+        }
+        // 自证要轮询等待，不能看一眼就下结论：/api/oauth/usage 对新窗口有传播延迟。
+        // 实测 2026-09-07 03:31:36 发出请求，03:31:42（6s）时接口仍是 resets_at=nil，
+        // 到 03:32:48（约 70s）才出现新窗口 08:30:00。只等 3 秒会稳定误报失败。
+        // refresh() 会重新拉 usage 并据此更新 windowEnd（只在 resets_at 落在未来时才更新）。
+        // 轮询期间 busyFiring 仍为 true，tick()/maybeAct() 不会插进来重复开火。
+        var end: Date?
+        for wait in [5, 10, 20, 30, 60] as [UInt64] {
+            try? await Task.sleep(nanoseconds: wait * 1_000_000_000)
+            await refresh()
+            if let e = windowEnd, e.timeIntervalSinceNow > 0 { end = e; break }
+        }
+        guard let end else {
+            lastFireResult = "⚠️ 直连 HTTP 200 但 125s 内未见新窗口 —— 直连开窗可能已失效"
+            log("FIRE direct HTTP 200 但 125s 内未见新窗口（windowEnd=\(fmt(windowEnd)) rawReset=\(fmt(fiveReset))）—— 直连开窗可能已失效，需要人工判断；临时退回：defaults write com.iu.keepalivebar directFire -bool false")
+            return false
+        }
+        let stamp = Date()
+        lastFire = stamp
+        UserDefaults.standard.set(stamp.timeIntervalSince1970, forKey: "lastFire")
+        lastFireResult = "保活成功（直连，~8 tokens）：新窗口 \(fmt(end)) 重置"
+        log("FIRED direct -> 新窗口 windowEnd=\(fmt(end))")
+        return true
+    }
+
+    func fireCLI() async {
+        log("FIRE start: claude -p 'Reply OK' --model haiku（脱钩：子进程自负钥匙串责任，避免弹授权框）")
+        let temporaryDirectory: URL
+        do {
+            temporaryDirectory = try makeTemporaryKeepaliveDirectory()
+        } catch {
+            lastFireResult = "保活失败：无法创建临时目录（\(error.localizedDescription)）"
+            log("FAILED: 无法创建临时目录：\(error.localizedDescription)")
+            return
+        }
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+        let env = baseEnv(); let wd = temporaryDirectory.path; let bin = keepaliveClaudeBin
         // 空目录 + 禁 MCP + 去除 API key（走订阅）+ Haiku
         // 用固定路径副本（keepaliveClaudeBin）而非 PATH 里天天更新的 claude，
         // 让钥匙串授权对象身份稳定，避免每次到期都弹版本号授权框。
         let cmd = "cd '\(wd)' && exec env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN " +
-                  "'\(bin)' -p 'hi' --model haiku --strict-mcp-config"
+                  "'\(bin)' -p 'Reply OK' --model haiku --strict-mcp-config"
         // 用 runDisclaimed 而非 run：claude 刷新 OAuth token 写钥匙串时不再算到本 App（ad-hoc 签名）头上，
         // 从而不再每次弹“允许访问钥匙串”框（详见 Shell.runDisclaimed 注释）。
         let r = await Task.detached { Shell.runDisclaimed("/bin/bash", ["-c", cmd], env: env) }.value
@@ -974,7 +1276,7 @@ struct UsageSections: View {
                 Text("Codex").font(.headline)
                 Spacer()
             }
-            codexRow("5 小时", s.codexPrimaryUsed, s.codexPrimaryReset, withDate: false)
+            codexRow("5 小时", s.codexPrimaryUsed, s.codexPrimaryReset, withDate: false, closed: s.codexWindowClosed)
             codexRow("周限", s.codexWeeklyUsed, s.codexWeeklyReset, withDate: true)
         }
     }
@@ -994,20 +1296,25 @@ struct UsageSections: View {
         }
     }
 
-    // Codex 行：剩余百分比 + 重置时间（withDate=true 时带日期，如 7月8日 04:59）
+    // Codex 行：已用百分比 + 重置时间（withDate=true 时带日期，如 7月8日 04:59）。
+    // 口径与上面 Claude 的 usageRow 保持一致：数字＝已用，进度条＝已用比例。
     @ViewBuilder
-    func codexRow(_ title: String, _ used: Double?, _ reset: Date?, withDate: Bool) -> some View {
+    func codexRow(_ title: String, _ used: Double?, _ reset: Date?, withDate: Bool,
+                  closed: Bool = false) -> some View {
         let rolledOff = reset.map { $0 <= s.now } ?? false
         let usedNow = rolledOff ? 0 : (used ?? 0)
         VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Text(title).font(.subheadline).bold()
                 Spacer()
-                Text(used == nil ? "—" : "剩余 \(Int((100 - usedNow).rounded()))%")
+                Text(used == nil ? "—" : "\(Int(usedNow.rounded()))%")
                     .font(.subheadline).foregroundStyle(sevColor(usedNow))
             }
             UsageBar(value: usedNow / 100, color: sevColor(usedNow))
-            if rolledOff {
+            if closed {
+                // wham/usage 说得很明确：当前没有活动窗口（reset_at 还在随时间滚动）
+                Text("当前无活动窗口，下次保活将开启新窗口").font(.caption2).foregroundStyle(.secondary)
+            } else if rolledOff {
                 Text("已重置（快照过期，无实时数据）").font(.caption2).foregroundStyle(.secondary)
             } else if let r = reset {
                 Text(withDate ? weeklyResetInfo(r, s.now) : resetInfo(r, s.now))

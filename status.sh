@@ -4,13 +4,54 @@ set -uo pipefail
 KA_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KEYCHAIN_SERVICE="${KA_KEYCHAIN_SERVICE:-Claude Code-credentials}"
 
-# Codex 只读本地快照：即使 Claude Keychain 不可用，也先显示 Codex 状态。
+# Codex 用量：优先问服务端真值 GET /backend-api/wham/usage（免费、不发消息、不需要 codex 跑过），
+# 拿不到才退回扫本地 rollout 快照。即使 Claude Keychain 不可用，也先显示 Codex 状态。
+codex_remote=""
+codex_auth_line=$(python3 -c '
+import json,os
+try:
+    t=json.load(open(os.path.expanduser("~/.codex/auth.json")))["tokens"]
+    a,b=t.get("access_token") or "", t.get("account_id") or ""
+    print(f"{a} {b}" if a and b else "")
+except Exception:
+    print("")')
+if [ -n "$codex_auth_line" ]; then
+  codex_remote=$(curl -s --max-time 20 "https://chatgpt.com/backend-api/wham/usage" \
+    -H "Authorization: Bearer ${codex_auth_line%% *}" \
+    -H "chatgpt-account-id: ${codex_auth_line##* }" \
+    -H "originator: codex_cli_rs" 2>/dev/null)
+  printf '%s' "$codex_remote" | python3 -c 'import json,sys; json.load(sys.stdin)["rate_limit"]' 2>/dev/null || codex_remote=""
+fi
+
+if [ -n "$codex_remote" ]; then
+  echo "── Codex 订阅用量（wham/usage 实时）─────────────────────────"
+  printf '%s' "$codex_remote" | python3 -c '
+import json,sys
+from datetime import datetime,timezone
+d=json.load(sys.stdin); rl=d["rate_limit"]
+def fmt(x):
+    if x is None: return "—"
+    t=datetime.fromtimestamp(float(x), timezone.utc).astimezone()
+    rem=float(x)-datetime.now(timezone.utc).timestamp()
+    sign="还剩" if rem >= 0 else "已过"
+    return f"{t:%Y-%m-%d %H:%M:%S %Z}（{sign} {int(abs(rem)//3600)}h{int((abs(rem)%3600)//60):02d}m）"
+p=rl.get("primary_window") or {}; s=rl.get("secondary_window") or {}
+# 空闲时 reset_at 是滚动的"此刻+窗口长度"，并非已锚定的窗口——见 keepalive.sh codex_usage_remote 注释
+after=p.get("reset_after_seconds"); win=p.get("limit_window_seconds")
+anchored = after is not None and win is not None and float(after) < float(win) - 5
+if anchored:
+    print("  5小时    用量 %6s%%   重置 %s" % (p.get("used_percent","—"), fmt(p.get("reset_at"))))
+else:
+    print("  5小时    当前无活动窗口（下次保活将开启新窗口）")
+print("  周限      用量 %6s%%   重置 %s" % (s.get("used_percent","—"), fmt(s.get("reset_at"))))
+print("  套餐      %s" % (d.get("plan_type") or "—"))'
+else
+echo "── Codex 订阅用量（本地快照 · wham/usage 不可达）─────────────"
 codex_line=""
 for f in $(find "$HOME/.codex/sessions" -type f -name 'rollout-*.jsonl' -print 2>/dev/null | xargs ls -t 2>/dev/null | head -20); do
   line=$(grep -a 'rate_limits' "$f" 2>/dev/null | tail -1)
   if [ -n "$line" ]; then codex_line="$line"; break; fi
 done
-echo "── Codex 订阅用量（本地快照）────────────────────────────────"
 if [ -n "$codex_line" ]; then
   printf '%s' "$codex_line" | python3 -c '
 import json,sys
@@ -18,7 +59,7 @@ from datetime import datetime,timezone
 try:
     d=json.load(sys.stdin); rl=((d.get("payload") or {}).get("rate_limits") or {})
     # primary/secondary 槽位不固定对应 5h/周——按 window_minutes 判定(≈300=5h, ≈10080=周)。
-    # 空闲(仅 hi 保活)快照往往只有周窗口、没有 5h 窗口，此时 5h 那行显示“—”，别把周 reset 当 5h。
+    # 空闲（仅 Reply OK 保活）快照往往只有周窗口、没有 5h 窗口，此时 5h 那行显示“—”，别把周 reset 当 5h。
     buckets=[b for b in (rl.get("primary"), rl.get("secondary")) if isinstance(b,dict)]
     has_win=any(isinstance(b.get("window_minutes"),(int,float)) for b in buckets)
     def pick(five):
@@ -46,7 +87,8 @@ try:
 except Exception:
     print("  快照格式无法识别")'
 else
-  echo "  暂无 Codex rate_limits 快照（自动激活计时会在 5 小时后发送 hi）"
+  echo "  暂无 Codex rate_limits 快照（自动激活计时会在 5 小时后发送 Reply OK）"
+fi
 fi
 if [ -f "$KA_HOME/codex-state.json" ]; then
   python3 -c '

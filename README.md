@@ -1,8 +1,9 @@
 # Claude Code / Codex 5 小时窗口 · 精确保活 (KeepAlive)
 
 在你不工作的时段，自动、**精确地**在每个 5 小时窗口关闭后立刻发一条极小消息，
-开启下一个 5 小时窗口。Claude 使用官方 usage reset；Codex 使用本地 rollout 日志里的
-`rate_limits.primary.resets_at`。如果 Codex 从未启动过、没有任何时间快照，则首次观察后等待 5 小时发送一条 `hi` 激活，之后自动按 reset 续窗。
+开启下一个 5 小时窗口。两侧都直接查服务端真值：Claude 用 `/api/oauth/usage`，
+Codex 用 `/backend-api/wham/usage`。那条"极小消息"是**直连 HTTP 的推理请求**，
+不再套一层 agent CLI —— Claude 8 tokens、Codex 30 tokens，而不是 22,698 / 13,871。
 
 ## 它凭什么“精确”
 
@@ -19,9 +20,44 @@ anthropic-beta: oauth-2025-04-20
 逻辑：轮询该字段 → 一旦越过重置时刻（窗口已关）→ 发一条极小的保活消息 → 开启新窗口 → 循环。
 由 launchd 每 5 分钟无状态轮询驱动，**睡眠/重启后自愈**。
 
-保活消息本身已压到最小上下文：`cd ~/Desktop/Null`（空目录，无文件/CLAUDE.md/git）
-+ `--model haiku`（最便宜）+ `--strict-mcp-config`（不加载任何 MCP 工具）
-+ `unset ANTHROPIC_API_KEY`（确保走订阅而非 API 账单）。
+## 保活消息为什么只要 8 个 token
+
+保活需要的只是**一条计费到订阅的推理请求**。`claude -p` / `codex exec` 会额外背上工具定义、
+系统提示词、全局 `CLAUDE.md`/`AGENTS.md`、skills 清单——这些对"开窗"没有任何贡献，
+却占了 99.9% 的 token。所以保活直接打 HTTP，用的是同一张订阅 OAuth 凭据：
+
+| | 旧写法（CLI） | 现在（直连 HTTP） |
+|---|---|---|
+| Claude | `claude -p 'Reply OK' --model haiku` → **22,698** in / 51 out | `POST /v1/messages` → **8** in / 1 out |
+| Codex | `codex exec 'Reply OK'` → **13,871** in / 16 out | `POST /backend-api/codex/responses` → **14** in / 16 out |
+
+（2026-09-06 同机同账号实测。Claude 那 141KB 请求体里，29 个工具定义就占 97KB。）
+
+**两侧都已实证直连确实能开窗**：
+- Codex：5h 窗口关闭后 `reset_at` 会随时间滚动（= 未锚定）；发出一条 30 token 的裸 HTTP
+  请求后，它立刻固定在"请求时刻 + 5h"不再变化 —— 新窗口已开。
+- Claude：2026-09-07 03:29:59 窗口关闭，03:31:36 直连发出 8 token 请求，`five_hour.resets_at`
+  从 `null` 变为 `08:30:00`（= 旧窗口末尾 + 5h，Claude 的窗口按半点对齐，不是从消息时刻起算）。
+
+⚠️ `/api/oauth/usage` 对新窗口有**传播延迟**：实测发出请求 6 秒后接口仍返回 `null`，约 70 秒
+后才出现新窗口。所以自证是**轮询等待**（Claude 累计 125s，Codex 53s）而不是发完看一眼——
+只等几秒会稳定误报"没开出窗口"。
+
+**自证，但故意不做自动降级**：每次直连发完都会回读 usage 确认窗口真的开出来了；
+没开出来（或直连本身失败、token 过期、离线）就**明确报错**，按原节奏重试并每次刷一条 ❌ 日志。
+
+不自动回落 CLI 是刻意的——否则直连哪天失效了，CLI 会把它悄悄补上，表面一切正常，
+实际早已退回每次 22,698 tokens 且无人察觉。宁可吵，也不要"看起来正常"。
+
+要手动退回旧写法：`KA_CLAUDE_DIRECT=0` / `KA_CODEX_DIRECT=0`（App 侧
+`defaults write com.iu.keepalivebar directFire -bool false`）。这是显式开关，不是自动降级。
+
+⚠️ 附带影响：codex 的登录态由 CLI 维护。既然不再自动回落 CLI，token 过期后直连会一直 401、
+不会被自动刷新——跑一次 `codex` 或重新登录即可。日志里会写清楚。
+
+CLI 路径（手动切回时）仍在独立的系统临时空目录中运行，命令结束后立即删除该目录，因此没有
+文件、`CLAUDE.md` 或 git 上下文可被读取或遗留；Claude 用 `--model haiku`、`--strict-mcp-config`，
+并清除 `ANTHROPIC_API_KEY`（确保走订阅而非 API 账单）。
 
 ## 两种运行方式（二选一，别同时开）
 
@@ -37,14 +73,14 @@ anthropic-beta: oauth-2025-04-20
 | `KeepAliveBar.swift` | 菜单栏 App 源码（SwiftUI `MenuBarExtra`，同时自动激活 Claude/Codex） |
 | `build-app.sh` | 编译 → 临时目录组包 → 整包替换 `/Applications/KeepAliveBar.app` 并重启（磁盘上只留这一份） |
 | `install-app.sh` | `build-app.sh` + 保活专用 `keepalive-claude` 固定副本 + 开机自启登录项（自动去重） |
-| `null/` | 保活消息从这个空目录发起（避免读入任何上下文） |
 | `keepalive.sh` | launchd 版核心：查 Claude usage / Codex 快照 → 判断 → 必要时发保活 |
 | `status.sh` | **只读**面板：打印 Claude/Codex 用量、重置时间和自动激活状态。随时可跑，不发消息 |
+| Codex 用量来源 | `GET /backend-api/wham/usage`（服务端真值，免费）；不可达时才退回扫 rollout 日志 |
 | `com.iu.claude-keepalive.plist` | launchd LaunchAgent 模板 |
 | `install.sh` / `uninstall.sh` | 启用 / 停用 launchd 后台服务 |
 | `keepalive.log` / `state.json` | launchd 版的日志与状态 |
 
-App 的日志/空目录在 `~/Library/Application Support/KeepAliveBar/`。
+App 的日志在 `~/Library/Application Support/KeepAliveBar/`。
 
 ## A · 菜单栏 App（推荐）
 
@@ -61,7 +97,14 @@ bash install-app.sh               # 再加：开机自启登录项 + keepalive-c
 
 菜单栏图标显示 Claude 距 5h 窗口重置的倒计时；点击弹窗有 Claude/Codex 的 5h/周用量、
 重置时间、`Claude 保活` / `Codex 保活` 两个独立开关、`开机自启`开关、`刷新` / `退出`。
-对应开关打开后，Claude 窗口一关会自动续窗；Codex 在已有 reset 快照时到期续窗，没有快照时连续 5 小时后发送 `hi`。
+对应开关打开后，Claude 窗口一关会自动续窗；Codex 由 `wham/usage` 判定：窗口到期、
+或服务端明确"当前无活动窗口"时立即续窗（该接口不可达时才退回旧的"连续 5 小时"兜底）。
+
+**两侧的窗口锚定方式不同**，这决定了各自要多"急"：Claude 按半点对齐（03:31 发的消息落进
+03:30–08:30 那个窗口，早发晚发不亏）；Codex 从**消息时刻**起算，晚发一秒就真少一秒。
+所以 App 对 Codex 的用量轮询平时是 5 分钟一次，**一旦窗口到点就收紧到 20 秒**，
+把每轮损耗从平均 ~2.5 分钟压到 ~10 秒；开火成功后自动恢复 5 分钟节奏。
+（关掉 Codex 保活、周限已满、或正在开火时不收紧，避免空转。）
 
 **周限闸门**：Claude 周限到 100%、或 Codex 周限剩余 0 时，5h 保活一律不发（发也发不出去，
 只会每 3 分钟撞一次墙刷错误日志）；越过周重置时刻自动解除——Claude 在下一次刷新拿到真实的新周用量后续窗，
@@ -74,7 +117,7 @@ Claude 侧被拦期间联网复查最多每 30 分钟一次（且不会晚于周
 | 开关 | 作用 |
 |---|---|
 | `Claude 保活` | Claude 5h 窗口关闭后是否自动续窗（独立开关，不影响 Codex） |
-| `Codex 保活` | Codex 5h 窗口到期后是否自动发 `hi` 续窗（独立开关，不影响 Claude） |
+| `Codex 保活` | Codex 5h 窗口到期后是否自动发 `Reply OK` 续窗（独立开关，不影响 Claude） |
 | `开机自启` | 注册登录项（`SMAppService`） |
 | `自动查询` | 点开弹窗时是否自动查一次用量 |
 | `隐藏倒计时` | 菜单栏只留 Clawd 图标，不显示 Claude 下次重置的剩余时间（暂停时仍显示 `⏸`，否则会忘了自己按过暂停） |
@@ -113,15 +156,17 @@ bash uninstall.sh
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `KA_MODEL` | `haiku` | 保活用的模型（最便宜，最省周限额） |
-| `KA_WORKDIR` | `~/Desktop/Null` | 从这个**空目录**发起保活，避免读入目录内容/CLAUDE.md/git 上下文 |
+| `KA_CLAUDE_DIRECT` | `1` | 1=直连 `POST /v1/messages` 保活（8 tokens）；0=手动退回 `claude -p`（22,698 tokens）。失败时不会自动降级 |
+| `KA_CODEX_DIRECT` | `1` | 1=直连 `POST .../codex/responses`（30 tokens）；0=手动退回 `codex exec`（13,871 tokens）。失败时不会自动降级 |
+| `KA_API_MODEL` | `claude-haiku-4-5-20251001` | 直连用的完整 model id（CLI 收别名，HTTP 不收） |
+| `KA_MODEL` | `haiku` | 切回 CLI 写法时用的模型（最便宜，最省周限额） |
 | `KA_BUFFER_SEC` | `90` | 真实重置时刻之后再等多少秒才发（确保旧窗口彻底关闭） |
 | `KA_MIN_REFIRE_SEC` | `17400` | 防抖：两次保活最小间隔（4h50m） |
 | `KA_WEEKLY_GUARD_PCT` | `101` | 周用量≥此百分比时暂停保活（默认永不触发；设 90 可省额度） |
 | `KA_CODEX_BIN` | 自动查找 | Codex CLI 路径 |
 | `KA_CODEX_MODEL` | `gpt-5.4-mini` | Codex 保活模型 |
 | `KA_CODEX_EFFORT` | `low` | Codex reasoning effort |
-| `KA_CODEX_PROMPT` | `hi` | Codex 保活消息，建议保持为 `hi` |
+| `KA_CODEX_PROMPT` | `Reply OK` | Codex 保活消息，建议保持为 `Reply OK` |
 | `KA_CODEX_FALLBACK_SEC` | `18000` | 没有 Codex reset 快照时，等待 5 小时再首次激活 |
 | `KA_CODEX_MIN_REFIRE_SEC` | `17400` | Codex 两次激活最小间隔（4h50m） |
 | 轮询频率 | plist `StartInterval=300` | 调小 → 窗口衔接更紧密，但请求更频繁 |
