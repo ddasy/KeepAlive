@@ -1,5 +1,5 @@
 #!/bin/bash
-# 编译 KeepAliveBar.swift 并**直接安装**到 /Applications/KeepAliveBar.app（菜单栏 Agent，无 Dock 图标）。
+# 编译 Sources/KeepAliveBar 并安装到 /Applications/KeepAliveBar.app（菜单栏 Agent，无 Dock 图标）。
 #
 # 为什么不在项目目录里留 .app：
 #   以前 build-app.sh 在项目目录产出一份、install-app.sh 再拷一份到 /Applications，
@@ -10,6 +10,7 @@
 # 只想编译试跑、不动已安装的那份：KA_DEST=/tmp/ka/KeepAliveBar.app bash build-app.sh
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$DIR/scripts/swift-sources.sh"
 DEST="${KA_DEST:-/Applications/KeepAliveBar.app}"
 BUNDLE_ID="com.iu.keepalivebar"
 
@@ -44,7 +45,7 @@ PLIST
 echo "▶ 编译 (swiftc)"
 swiftc -O -parse-as-library \
     -target arm64-apple-macos13.0 \
-    "$DIR/KeepAliveBar.swift" \
+    "${KA_LIBRARY_SOURCES[@]}" "$KA_APP_ENTRY" \
     -o "$STAGE/Contents/MacOS/KeepAliveBar"
 
 echo "▶ 拷贝资源（Clawd 菜单栏图标 + App 图标）"
@@ -54,6 +55,13 @@ cp "$DIR/assets/AppIcon.icns" "$STAGE/Contents/Resources/AppIcon.icns"
 
 echo "▶ ad-hoc 签名"
 codesign --force --sign - "$STAGE"
+codesign --verify --strict "$STAGE"
+
+# CI / 开发验证：完成编译、资源组包及签名验证，随后由 trap 清理临时包。
+if [[ "${KA_VERIFY_ONLY:-0}" == "1" ]]; then
+    echo "✅ 构建验证通过（未安装、未启动）"
+    exit 0
+fi
 
 # 编译签名全部成功后才动已安装的那份：编译失败不会把你正在用的 App 删掉。
 echo "▶ 退出旧实例（按完整可执行路径匹配，不会误伤其它进程）"

@@ -70,7 +70,9 @@ CLI 路径（手动切回时）仍在独立的系统临时空目录中运行，�
 
 | 文件 | 作用 |
 |---|---|
-| `KeepAliveBar.swift` | 菜单栏 App 源码（SwiftUI `MenuBarExtra`，同时自动激活 Claude/Codex） |
+| `Sources/KeepAliveBar/` | 菜单栏 App，按状态、策略、平台实现、展示和界面分目录 |
+| `scripts/swift-sources.sh` | 构建与测试共用的 Swift 源文件清单 |
+| `docs/ARCHITECTURE.md` | 模块职责、状态约束、新功能放置规则与验证流程 |
 | `build-app.sh` | 编译 → 临时目录组包 → 整包替换 `/Applications/KeepAliveBar.app` 并重启（磁盘上只留这一份） |
 | `install-app.sh` | `build-app.sh` + 保活专用 `keepalive-claude` 固定副本 + 开机自启登录项（自动去重） |
 | `keepalive.sh` | launchd 版核心：查 Claude usage / Codex 快照 → 判断 → 必要时发保活 |
@@ -151,6 +153,9 @@ App 会根据之后查到的真实窗口重新计算，不能保证平台侧重�
 
 开发验证：`bash tests/run-cross-keepalive.sh`，使用独立偏好设置测试实际 Store 与调度策略，
 不启动 App 定时器、不联网、不发送保活请求。
+测试直接编译生产源文件，以依赖注入隔离偏好设置，不改写源代码。
+完整构建验证：`KA_VERIFY_ONLY=1 bash build-app.sh`，检查编译、资源与签名，不影响已安装实例。
+工程结构与新增功能指南见 [架构文档](docs/ARCHITECTURE.md)。
 
 ## B · launchd 脚本
 
