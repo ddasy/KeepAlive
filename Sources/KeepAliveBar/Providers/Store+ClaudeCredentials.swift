@@ -15,15 +15,18 @@ extension Store {
             Shell.run("/usr/bin/security", ["find-generic-password", "-s", svc, "-w"], env: env)
         }.value
         guard r.code == 0 else {
+            claudeLoginExpiresAt = nil
             let msg = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
             return Credential(accessToken: nil, refreshToken: nil, scopes: [], expiresAtMs: nil,
                               diag: "security rc=\(r.code) \(String(msg.prefix(140)))")
         }
         guard let d = r.out.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else {
+            claudeLoginExpiresAt = nil
             return Credential(accessToken: nil, refreshToken: nil, scopes: [], expiresAtMs: nil,
                               diag: "凭据 JSON 解析失败")
         }
+        claudeLoginExpiresAt = LoginExpiry.claudeDeadline(from: obj)
         let o = (obj["claudeAiOauth"] as? [String: Any]) ?? obj
         let tok = o["accessToken"] as? String
         let exp = (o["expiresAt"] as? NSNumber)?.doubleValue
@@ -32,6 +35,19 @@ extension Store {
                           scopes: (o["scopes"] as? [String]) ?? [],
                           expiresAtMs: exp,
                           diag: tok == nil ? "凭据里无 accessToken 字段（API-key 用户？）" : "")
+    }
+
+    // Local metadata only: remains available when monitoring is paused or the proxy is offline.
+    func refreshLoginExpiryIfNeeded() {
+        guard monitoringEnabled, !checkingLoginExpiry,
+              lastLoginExpiryCheck.map({ Date().timeIntervalSince($0) >= 300 }) ?? true else { return }
+        checkingLoginExpiry = true
+        lastLoginExpiryCheck = Date()
+        Task { [weak self] in
+            guard let self else { return }
+            _ = await self.readCredential()
+            self.checkingLoginExpiry = false
+        }
     }
 
     // token 过期状态的紧凑串：把剩余寿命算出来，供 401 时对照（过期→大概率就是 401 主因）。

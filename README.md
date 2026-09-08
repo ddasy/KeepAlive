@@ -191,7 +191,7 @@ bash uninstall.sh
 | `KA_MIN_REFIRE_SEC` | `17400` | 防抖：两次保活最小间隔（4h50m） |
 | `KA_WEEKLY_GUARD_PCT` | `101` | 周用量≥此百分比时暂停保活（默认永不触发；设 90 可省额度） |
 | `KA_CODEX_BIN` | 自动查找 | Codex CLI 路径 |
-| `KA_CODEX_MODEL` | `gpt-5.4-mini` | Codex 保活模型 |
+| `KA_CODEX_MODEL` | `gpt-5.6-luna` | Codex 保活模型 |
 | `KA_CODEX_EFFORT` | `low` | Codex reasoning effort |
 | `KA_CODEX_PROMPT` | `Reply OK` | Codex 保活消息，建议保持为 `Reply OK` |
 | `KA_CODEX_FALLBACK_SEC` | `18000` | 没有 Codex reset 快照时，等待 5 小时再首次激活 |
@@ -213,3 +213,11 @@ bash uninstall.sh
 
 4. **这是对个人订阅的自动化“保温”，属灰色地带。** 仅用于你自己的账号；Anthropic 未来的政策
    调整可能限制此类用法。请自行判断是否符合你的使用条款。
+
+登录到期提醒：Claude 区域在点击弹窗和悬停快照中显示钥匙串的
+`refreshTokenExpiresAt`（登录续期截止时间），提前 3 天显示提醒，截止后提示执行 `/login`。
+菜单栏同时显示 `⚠︎`，即使隐藏倒计时或暂停保活也会保留提醒。
+登录期限启动时读取、此后每 5 分钟本地复查；重新登录后的正常凭据读取也会更新期限。
+登录期限与名称同一行右对齐；读取失败或字段缺失时隐藏期限条目，不会用短期 `expiresAt` 替代。
+Codex 当前凭据没有提供可确认的登录到期时间，因此不显示期限条目。
+手动排序时点击名称展示上下箭头，临时隐藏该区域的期限与提醒；完成移动、再次点击名称或关闭弹窗后恢复。

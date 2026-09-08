@@ -48,7 +48,7 @@ if [ -z "$CODEX_BIN" ]; then
     if [ -x "$candidate" ]; then CODEX_BIN="$candidate"; break; fi
   done
 fi
-CODEX_MODEL="${KA_CODEX_MODEL:-gpt-5.4-mini}"
+CODEX_MODEL="${KA_CODEX_MODEL:-gpt-5.6-luna}"
 CODEX_EFFORT="${KA_CODEX_EFFORT:-low}"
 CODEX_PROMPT="${KA_CODEX_PROMPT:-Reply OK}"
 CODEX_FALLBACK_SEC="${KA_CODEX_FALLBACK_SEC:-18000}"  # 没有 reset 快照时的 5 小时兜底

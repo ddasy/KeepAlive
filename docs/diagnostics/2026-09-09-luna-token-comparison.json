@@ -1,0 +1,120 @@
+{
+  "model": "gpt-5.6-luna",
+  "endpoint": "https://chatgpt.com/backend-api/codex/responses",
+  "instructions": "Reply OK.",
+  "input_text": "hi",
+  "reasoning_summary": "auto",
+  "omitted_definition": "Omit reasoning.effort; retain reasoning.summary=auto.",
+  "results": [
+    {
+      "round": 1,
+      "setting": "low",
+      "http": 200,
+      "status": "completed",
+      "effective_effort": "low",
+      "output": "OK",
+      "input": 14,
+      "output_tokens": 5,
+      "reasoning_tokens": 0,
+      "total": 19
+    },
+    {
+      "round": 1,
+      "setting": "omitted",
+      "http": 200,
+      "status": "completed",
+      "effective_effort": "medium",
+      "output": "OK",
+      "input": 14,
+      "output_tokens": 5,
+      "reasoning_tokens": 0,
+      "total": 19
+    },
+    {
+      "round": 1,
+      "setting": "none",
+      "http": 200,
+      "status": "completed",
+      "effective_effort": "none",
+      "output": "OK",
+      "input": 14,
+      "output_tokens": 5,
+      "reasoning_tokens": 0,
+      "total": 19
+    },
+    {
+      "round": 2,
+      "setting": "low",
+      "http": 200,
+      "status": "completed",
+      "effective_effort": "low",
+      "output": "OK",
+      "input": 14,
+      "output_tokens": 5,
+      "reasoning_tokens": 0,
+      "total": 19
+    },
+    {
+      "round": 2,
+      "setting": "omitted",
+      "http": 200,
+      "status": "completed",
+      "effective_effort": "medium",
+      "output": "OK",
+      "input": 14,
+      "output_tokens": 5,
+      "reasoning_tokens": 0,
+      "total": 19
+    },
+    {
+      "round": 2,
+      "setting": "none",
+      "http": 200,
+      "status": "completed",
+      "effective_effort": "none",
+      "output": "OK",
+      "input": 14,
+      "output_tokens": 5,
+      "reasoning_tokens": 0,
+      "total": 19
+    },
+    {
+      "round": 3,
+      "setting": "low",
+      "http": 200,
+      "status": "completed",
+      "effective_effort": "low",
+      "output": "OK",
+      "input": 14,
+      "output_tokens": 5,
+      "reasoning_tokens": 0,
+      "total": 19
+    },
+    {
+      "round": 3,
+      "setting": "omitted",
+      "http": 200,
+      "status": "completed",
+      "effective_effort": "medium",
+      "output": "OK",
+      "input": 14,
+      "output_tokens": 5,
+      "reasoning_tokens": 0,
+      "total": 19
+    },
+    {
+      "round": 3,
+      "setting": "none",
+      "http": 200,
+      "status": "completed",
+      "effective_effort": "none",
+      "output": "OK",
+      "input": 14,
+      "output_tokens": 5,
+      "reasoning_tokens": 0,
+      "total": 19
+    }
+  ],
+  "decision": "All configurations tied at 19 tokens per request. Retain explicit low; no measured saving from omitted or none.",
+  "limitations": "Three samples per configuration; this minimal keepalive prompt only; total tokens are not subscription quota units."
+}

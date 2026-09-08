@@ -12,7 +12,17 @@ extension Store {
     // 菜单栏标题与图标共用 displayedCodexFirst，始终显示置顶 AI 的 5h 窗口。
     // 返回 "" 表示“菜单栏只留图标”（隐藏倒计时）；暂停态仍保留 ⏸——它是运行状态而非刷新时间，
     // 否则关掉保活后菜单栏毫无痕迹，容易忘了自己按过暂停。
+    var loginExpiryWarning: Bool {
+        LoginExpiry.needsReminder(claudeLoginExpiresAt, now: now)
+    }
+
     var menuTitle: String {
+        let title = countdownTitle
+        guard loginExpiryWarning else { return title }
+        return title.isEmpty ? "⚠︎" : "⚠︎ " + title
+    }
+
+    private var countdownTitle: String {
         if paused { return "⏸" }
         if hideCountdown { return "" }
         let codex = displayedCodexFirst

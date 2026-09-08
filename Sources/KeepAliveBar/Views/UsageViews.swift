@@ -17,6 +17,7 @@ struct UsageSections: View {
                 if codex != s.displayedCodexFirst { Divider() }
                 VStack(alignment: .leading, spacing: 12) {
                     sectionHeader(codex: codex)
+                    loginExpiryReminder(codex: codex)
                     if codex {
                         codexRow("5 小时", s.codexPrimaryUsed, s.codexPrimaryReset, withDate: false, closed: s.codexWindowClosed)
                         codexRow("周限", s.codexWeeklyUsed, s.codexWeeklyReset, withDate: true)
@@ -30,6 +31,35 @@ struct UsageSections: View {
             }
         }
         .onDisappear { selectedCodex = nil }
+        .onChange(of: s.automaticSorting) { _ in selectedCodex = nil }
+    }
+
+    private func isReordering(_ codex: Bool) -> Bool {
+        allowsReordering && !s.automaticSorting && selectedCodex == codex
+    }
+
+    @ViewBuilder
+    private func loginExpiryLabel(codex: Bool) -> some View {
+        if !codex, let deadline = s.claudeLoginExpiresAt {
+            Text("登录到期 \(deadline.formatted(.dateTime.month(.twoDigits).day(.twoDigits).hour().minute()))")
+                .font(.caption2)
+                .foregroundStyle(deadline <= s.now ? Color.red : (s.loginExpiryWarning ? Color.orange : Color.secondary))
+                .lineLimit(1)
+                .minimumScaleFactor(0.85)
+                .help("登录到期：\(deadline.formatted(.dateTime.year().month().day().hour().minute()))")
+        }
+    }
+
+    @ViewBuilder
+    private func loginExpiryReminder(codex: Bool) -> some View {
+        if !codex, !isReordering(codex), let deadline = s.claudeLoginExpiresAt, s.loginExpiryWarning {
+            Text(deadline <= s.now
+                 ? "⚠︎ 登录续期截止时间已过，请在 Claude Code 执行 /login"
+                 : "⚠︎ 剩余 \(Store.dhm(deadline.timeIntervalSince(s.now)))，请在到期前执行 /login")
+                .font(.caption2)
+                .foregroundStyle(deadline <= s.now ? Color.red : Color.orange)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     private func sectionHeader(codex: Bool) -> some View {
@@ -40,29 +70,31 @@ struct UsageSections: View {
                 Button {
                     selectedCodex = selectedCodex == codex ? nil : codex
                 } label: {
-                    HStack {
-                        Text(title).font(.headline)
-                        Spacer(minLength: 0)
-                    }
-                    .contentShape(Rectangle())
+                    Text(title).font(.headline).fixedSize()
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .help("点击调整 \(title) 的位置")
                 .accessibilityLabel("\(title)，调整顺序")
-                if selectedCodex == codex {
-                    moveButton(title: title, up: true, enabled: !isFirst)
-                    moveButton(title: title, up: false, enabled: isFirst)
-                }
             } else {
-                Text(title).font(.headline)
-                Spacer()
+                Text(title).font(.headline).fixedSize()
+            }
+            Spacer(minLength: 6)
+            if isReordering(codex) {
+                moveButton(title: title, up: true, enabled: !isFirst)
+                moveButton(title: title, up: false, enabled: isFirst)
+            } else {
+                loginExpiryLabel(codex: codex)
             }
         }
     }
 
     private func moveButton(title: String, up: Bool, enabled: Bool) -> some View {
         Button {
-            withAnimation(.easeInOut(duration: 0.16)) { s.codexFirst.toggle() }
+            withAnimation(.easeInOut(duration: 0.16)) {
+                s.codexFirst.toggle()
+                selectedCodex = nil
+            }
         } label: {
             Image(systemName: up ? "chevron.up" : "chevron.down")
                 .font(.system(size: 11, weight: .semibold))

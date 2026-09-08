@@ -66,8 +66,9 @@ extension Store {
     }
 
     func tick() {
-        guard !paused else { return }   // 暂停：不倒计时、不联网、不续窗
-        now = Date()   // 本地倒计时（不联网）
+        now = Date()   // 登录到期提醒在暂停时也继续计时
+        refreshLoginExpiryIfNeeded()
+        guard !paused else { return }   // 暂停：不联网、不续窗
         // 交叉模式需周期性读两边真值，识别用户在等待期间自行开启的新窗口。
         if crossActive, !crossRefreshing,
            lastCrossRefresh.map({ now.timeIntervalSince($0) >= 300 }) ?? true {

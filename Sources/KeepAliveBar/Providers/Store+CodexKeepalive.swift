@@ -81,7 +81,7 @@ extension Store {
         req.setValue("text/event-stream", forHTTPHeaderField: "accept")
         req.timeoutInterval = 60
         let body: [String: Any] = [
-            "model": "gpt-5.4-mini",
+            "model": "gpt-5.6-luna",
             "instructions": "Reply OK.",
             "input": [["type": "message", "role": "user",
                        "content": [["type": "input_text", "text": "hi"]]]],
@@ -129,7 +129,7 @@ extension Store {
     }
 
     func fireCodexCLI() async {
-        log("CODEX FIRE start: codex exec 'Reply OK' --model gpt-5.4-mini --effort low")
+        log("CODEX FIRE start: codex exec 'Reply OK' --model gpt-5.6-luna --effort low")
         let temporaryDirectory: URL
         do {
             temporaryDirectory = try makeTemporaryKeepaliveDirectory()
@@ -146,7 +146,7 @@ extension Store {
         var args = keepaliveCodexUsesEnv ? ["codex"] : []
         args += [
             "--ask-for-approval", "never",
-            "exec", "--model", "gpt-5.4-mini",
+            "exec", "--model", "gpt-5.6-luna",
             "-c", "model_reasoning_effort=low",
             // 强制直连 HTTP(responses)、跳过 websocket。codex 默认先连 wss://chatgpt.com/.../responses，
             // 网络不稳时这一步常 403/超时后才降级 HTTP，白等一截、还不确定。内置 openai provider 不可覆盖，

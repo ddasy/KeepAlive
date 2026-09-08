@@ -53,5 +53,29 @@ extension TestSuite {
         check(s.menuTitle.isEmpty, "hidden countdown remains hidden with Codex first")
         s.paused = true
         check(s.menuTitle == "⏸", "pause indicator remains visible")
+        s.claudeLoginExpiresAt = base.addingTimeInterval(LoginExpiry.warningInterval + 1)
+        check(!s.loginExpiryWarning, "no early login warning")
+        s.claudeLoginExpiresAt = base.addingTimeInterval(LoginExpiry.warningInterval)
+        check(s.loginExpiryWarning, "login warning starts exactly three days before expiry")
+        check(s.menuTitle == "⚠︎ ⏸", "login warning remains visible while paused")
+        s.paused = false
+        check(s.menuTitle == "⚠︎", "login warning remains visible when countdown hidden")
+        s.hideCountdown = false
+        check(s.menuTitle == "⚠︎ now", "warning covers Claude even when Codex is first")
+        s.claudeLoginExpiresAt = base.addingTimeInterval(-1)
+        check(s.loginExpiryWarning, "expired login still warns")
+        s.claudeLoginExpiresAt = later.addingTimeInterval(30 * 86400)
+        check(!s.loginExpiryWarning, "renewal clears login warning")
+        s.claudeLoginExpiresAt = nil
+        check(!s.loginExpiryWarning, "unknown login expiry does not invent warning")
+        let ms = base.timeIntervalSince1970 * 1000
+        check(LoginExpiry.claudeDeadline(from: ["claudeAiOauth": ["refreshTokenExpiresAt": ms]]) == base,
+              "refresh token milliseconds decoded")
+        check(LoginExpiry.claudeDeadline(from: ["expiresAt": ms]) == nil,
+              "access token expiry must never substitute for login expiry")
+        for invalid: Any in [0, -1, true, "bad", Double.infinity, Double.nan] {
+            check(LoginExpiry.claudeDeadline(from: ["refreshTokenExpiresAt": invalid]) == nil,
+                  "invalid login deadline is unknown")
+        }
     }
 }

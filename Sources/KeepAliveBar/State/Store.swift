@@ -9,6 +9,7 @@ final class Store: ObservableObject {
     // 单例：SwiftUI 场景与 AppDelegate（悬停快照）共用同一份状态
     static let shared = Store()
     let preferences: UserDefaults
+    let monitoringEnabled: Bool
 
     @Published var fivePct: Double?
     @Published var fiveReset: Date?       // 接口原始 five_hour.resets_at（窗口过期后可能为 null → nil）
@@ -54,6 +55,9 @@ final class Store: ObservableObject {
     @Published var codexWindowClosed = false
     @Published var codexLastFire: Date?
     @Published var codexLastFireResult: String = ""
+    @Published var claudeLoginExpiresAt: Date?
+    var lastLoginExpiryCheck: Date?
+    var checkingLoginExpiry = false
     @Published var lastError: String?
     @Published var lastFire: Date?
     @Published var lastFireResult: String = ""
@@ -152,6 +156,7 @@ final class Store: ObservableObject {
 
     init(preferences: UserDefaults = .standard, monitoring: Bool = true) {
         self.preferences = preferences
+        self.monitoringEnabled = monitoring
         self.codexFirst = preferences.bool(forKey: "codexFirst")
         self.automaticSorting = preferences.bool(forKey: "automaticSorting")
         // 迁移：旧版只有一个 autoEnabled，拆分后它作为两路开关的默认值（都没写过新键时）
@@ -183,6 +188,7 @@ final class Store: ObservableObject {
             self.codexNoSnapshotSince = Date(timeIntervalSince1970: t)
         }
         guard monitoring else { return } // 测试仅恢复状态，不启动网络、定时器或授权预热
+        refreshLoginExpiryIfNeeded()
         launchAtLogin = (SMAppService.mainApp.status == .enabled)
         let needsBootstrap = windowEnd == nil
         log("APP start (claudeAuto=\(claudeAutoEnabled) codexAuto=\(codexAutoEnabled) paused=\(paused) restoredWindowEnd=\(fmt(windowEnd))) — \(needsBootstrap ? "无窗口时间，立即拉取" : "5 分钟后首次拉取")")
