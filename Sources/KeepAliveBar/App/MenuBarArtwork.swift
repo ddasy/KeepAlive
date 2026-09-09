@@ -3,6 +3,18 @@ import AppKit
 // 原生矢量绘制：参考图的紫蓝渐变云朵 + 白色终端提示符。
 // drawingHandler 按屏幕倍率渲染，在 Retina 菜单栏上也保持清晰。
 enum MenuBarArtwork {
+    // Clawd 像素蟹（保留彩色，不做模板染色）。放在这里而不是 App 入口，是因为菜单栏标签
+    // 现在由 MenuBarCountdown 合成，而入口文件不参与库编译（测试只编译库源文件）。
+    static let clawd: NSImage? = {
+        guard let url = Bundle.main.url(forResource: "clawd", withExtension: "png"),
+              let image = NSImage(contentsOf: url) else { return nil }
+        let height: CGFloat = 13
+        let ratio = image.size.height > 0 ? image.size.width / image.size.height : 1.6
+        image.size = NSSize(width: height * ratio, height: height)   // 保持宽高比，不压扁
+        image.isTemplate = false
+        return image
+    }()
+
     static let codex: NSImage = {
         if let url = Bundle.main.url(forResource: "codex", withExtension: "png"),
            let image = NSImage(contentsOf: url) {

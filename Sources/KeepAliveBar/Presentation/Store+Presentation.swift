@@ -22,6 +22,15 @@ extension Store {
         return title.isEmpty ? "⚠︎" : "⚠︎ " + title
     }
 
+    // 菜单栏倒计时的填充比例：必须与弹窗里那张卡片上置顶 AI 的 5h 用量条**逐字一致**——
+    // Claude 用 fivePct，Codex 照抄 codexRow 的算法（只有快照过期 reset<=now 才归零；
+    // codexWindowClosed 只改卡片上的说明文字，不动百分比）。没有数据返回 nil＝不填充。
+    var menuUsagePercent: Double? {
+        guard displayedCodexFirst else { return fivePct }
+        let rolledOff = codexPrimaryReset.map { $0 <= now } ?? false
+        return rolledOff ? 0 : codexPrimaryUsed
+    }
+
     private var countdownTitle: String {
         if paused { return "⏸" }
         if hideCountdown { return "" }

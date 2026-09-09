@@ -49,6 +49,26 @@ extension TestSuite {
         check(s.menuTitle == "–", "missing Codex window does not display Claude countdown")
         s.codexWindowClosed = true
         check(s.menuTitle == "now", "closed Codex window shows now")
+        check(s.menuUsagePercent == 100, "closed Codex window still fills like its card")
+        s.codexWindowClosed = false
+        s.codexPrimaryReset = base.addingTimeInterval(21 * 60)
+        check(s.menuUsagePercent == 100, "Codex countdown fills with the Codex 5h usage")
+        s.codexPrimaryReset = base.addingTimeInterval(-1)
+        check(s.menuUsagePercent == 0, "expired Codex snapshot fills nothing")
+        s.codexPrimaryReset = base.addingTimeInterval(21 * 60)
+        s.codexPrimaryUsed = nil
+        check(s.menuUsagePercent == nil, "missing Codex usage leaves the countdown unfilled")
+        s.codexFirst = false
+        s.fivePct = 42
+        check(s.menuUsagePercent == 42, "Claude countdown fills with the Claude 5h usage")
+        check(UsageSeverity.of(69.9) == .normal && UsageSeverity.of(70) == .warning
+              && UsageSeverity.of(89.9) == .warning && UsageSeverity.of(90) == .critical
+              && UsageSeverity.of(nil) == .unknown, "fill colour thresholds match the usage bars")
+        s.fivePct = 10
+        s.codexFirst = true                     // 复原 codex 置顶 + 窗口已关，后面的 ⚠︎ 断言依赖这个状态
+        s.codexPrimaryUsed = 100
+        s.codexPrimaryReset = nil
+        s.codexWindowClosed = true
         s.hideCountdown = true
         check(s.menuTitle.isEmpty, "hidden countdown remains hidden with Codex first")
         s.paused = true

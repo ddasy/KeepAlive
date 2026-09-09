@@ -1,10 +1,37 @@
 import SwiftUI
+import AppKit
 
 // MARK: - 展示辅助
-func sevColor(_ pct: Double?) -> Color {
-    guard let p = pct else { return .gray }
-    if p < 70 { return .green } else if p < 90 { return .orange } else { return .red }
+// 用量严重度只在这里定义一次：弹窗/悬停快照的用量条用 color，菜单栏倒计时的填充用 menuBarColor，
+// 两处永远同一套阈值（<70% 绿 / <90% 橙 / 其余红）。
+enum UsageSeverity {
+    case unknown, normal, warning, critical
+
+    static func of(_ pct: Double?) -> UsageSeverity {
+        guard let p = pct else { return .unknown }
+        if p < 70 { return .normal } else if p < 90 { return .warning } else { return .critical }
+    }
+
+    var color: Color {
+        switch self {
+        case .unknown: return .gray
+        case .normal: return .green
+        case .warning: return .orange
+        case .critical: return .red
+        }
+    }
+
+    var menuBarColor: NSColor {
+        switch self {
+        case .unknown: return .systemGray
+        case .normal: return .systemGreen
+        case .warning: return .systemOrange
+        case .critical: return .systemRed
+        }
+    }
 }
+
+func sevColor(_ pct: Double?) -> Color { UsageSeverity.of(pct).color }
 func localHM(_ d: Date) -> String { let f = DateFormatter(); f.dateFormat = "HH:mm"; return f.string(from: d) }
 func localMDHM(_ d: Date) -> String { let f = DateFormatter(); f.dateFormat = "MM-dd HH:mm"; return f.string(from: d) }
 func localMonthDayHM(_ d: Date) -> String { let f = DateFormatter(); f.dateFormat = "M月d日 HH:mm"; return f.string(from: d) }
