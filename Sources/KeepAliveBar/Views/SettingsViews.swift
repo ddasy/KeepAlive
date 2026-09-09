@@ -94,8 +94,208 @@ struct SettingsToggleRow: View {
     }
 }
 
-// 下半部分：开关、按钮、上次保活结果 —— 只出现在点击弹窗里，悬停快照不含这些
+// 首页仅显示快捷操作和错误；保活记录与一般状态放在设置中。
 struct ControlSections: View {
+    @EnvironmentObject var s: Store
+    var openSettings: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            FeatureControls(settings: false)
+
+            HStack(spacing: 8) {
+                Button(s.paused ? "恢复" : "暂停") { s.togglePause() }
+                Button("刷新") { s.refreshNow() }.disabled(s.paused)
+                Button("设置", action: openSettings)
+                Spacer()
+                Button("退出") { NSApp.terminate(nil) }
+            }
+
+            if s.lastFireFailed, !s.lastFireResult.isEmpty {
+                Text(s.lastFireResult).font(.caption2).foregroundStyle(.red)
+            }
+            if s.codexLastFireFailed, !s.codexLastFireResult.isEmpty {
+                Text(s.codexLastFireResult).font(.caption2).foregroundStyle(.red)
+            }
+            if let e = s.lastError {
+                Text(e).font(.caption2).foregroundStyle(.red)
+            }
+        }
+    }
+}
+
+struct FeatureControls: View {
+    @EnvironmentObject var s: Store
+    var settings: Bool
+
+    private func includes(_ control: MenuControl) -> Bool {
+        settings || s.showsMenuControl(control)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if includes(.claude) || includes(.codex) || includes(.cross) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("保活")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .padding(.leading, 4)
+                    HStack(spacing: 8) {
+                        if includes(.claude) {
+                            KeepAliveToggleCard(title: "Claude", mark: "C", isOn: $s.claudeAutoEnabled)
+                        }
+                        if includes(.codex) {
+                            KeepAliveToggleCard(title: "Codex", mark: ">_", isOn: $s.codexAutoEnabled)
+                        }
+                    }
+                    if includes(.cross) {
+                        HStack(spacing: 10) {
+                            Text("交叉保活").font(.caption)
+                            Spacer(minLength: 0)
+                            Menu {
+                                ForEach(Array(stride(from: 30, through: 145, by: 5)), id: \.self) { minutes in
+                                    Button {
+                                        s.crossIntervalMinutes = Double(minutes)
+                                    } label: {
+                                        if Int(s.crossIntervalMinutes) == minutes {
+                                            Label("\(minutes) 分钟", systemImage: "checkmark")
+                                        } else {
+                                            Text("\(minutes) 分钟")
+                                        }
+                                    }
+                                }
+                            } label: {
+                                Text("间隔＞\(Int(s.crossIntervalMinutes)) 分钟").font(.caption)
+                            }
+                            .menuStyle(.borderlessButton)
+                            .fixedSize()
+                            .accessibilityLabel("交叉保活间隔")
+                            .accessibilityValue("大于 \(Int(s.crossIntervalMinutes)) 分钟")
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.16)) {
+                                    s.crossKeepaliveEnabled.toggle()
+                                }
+                            } label: {
+                                ToggleCheckmark(isOn: s.crossKeepaliveEnabled, compact: true)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("交叉保活")
+                            .accessibilityValue(s.crossKeepaliveEnabled ? "已开启" : "已关闭")
+                        }
+                        .padding(.horizontal, 11)
+                        .frame(height: 42)
+                        .background(s.crossKeepaliveEnabled ? Color.accentColor.opacity(0.055) : Color.clear)
+                        if settings && s.crossKeepaliveEnabled {
+                            Text(s.crossStatus)
+                                .font(.caption2).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+
+            }
+            if [.login, .query, .sort, .countdown].contains(where: includes) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("应用")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .padding(.leading, 4)
+                    VStack(spacing: 0) {
+                        if includes(.login) {
+                            SettingsToggleRow(
+                                title: "开机自启",
+                                isOn: Binding(
+                                    get: { s.launchAtLogin },
+                                    set: { s.setLaunchAtLogin($0) }
+                                ))
+                        }
+                        if includes(.query) { SettingsToggleRow(title: "自动查询", isOn: $s.autoQueryOnOpen) }
+                        if includes(.sort) {
+                            SettingsToggleRow(title: "自动排序", isOn: $s.automaticSorting)
+                                .help("优先显示 5 小时内较早到期的 AI；用满后切换到仍有额度的 AI。关闭后恢复手动顺序。")
+                        }
+                        if includes(.countdown) { SettingsToggleRow(title: "隐藏倒计时", isOn: $s.hideCountdown) }
+                    }
+                    .background(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(Color.primary.opacity(0.035))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .strokeBorder(Color.secondary.opacity(0.18), lineWidth: 1)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                }
+
+            }
+        }
+    }
+}
+
+struct AppSettingsView: View {
+    @EnvironmentObject var s: Store
+    var close: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("设置").font(.headline)
+                Spacer()
+                Button("返回", action: close)
+            }
+            Divider()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    KeepaliveActivitySection()
+                    Divider()
+                    FeatureControls(settings: true)
+                    Divider()
+                    Text("菜单栏弹窗显示").font(.headline)
+                    Text("选择在首页显示的快捷开关。隐藏不会关闭功能，仍可在设置中操作。")
+                        .font(.caption).foregroundStyle(.secondary)
+                    ForEach(MenuControl.allCases) { control in
+                        SettingsToggleRow(
+                            title: control.title,
+                            isOn: Binding(
+                                get: { s.showsMenuControl(control) },
+                                set: { s.setMenuControl(control, visible: $0) }))
+                    }
+                    Divider()
+                    Text("菜单栏进度条").font(.headline)
+                    Text("颜色深度越高，颜色越浓；0% 为透明。")
+                        .font(.caption).foregroundStyle(.secondary)
+                    opacitySlider("填充色", value: $s.menuBarFillOpacity)
+                    opacitySlider("底色", value: $s.menuBarTrackOpacity)
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Color.primary.opacity(s.menuBarTrackOpacity))
+                        Capsule().fill(Color.green.opacity(s.menuBarFillOpacity)).frame(width: 140)
+                    }
+                    .frame(height: 4)
+                    .accessibilityLabel("进度条颜色预览，已用约一半")
+                    Button("恢复默认深度") {
+                        s.menuBarFillOpacity = 1
+                        s.menuBarTrackOpacity = 0.22
+                    }
+                }.padding(.trailing, 4)
+            }
+        }
+    }
+
+    private func opacitySlider(_ title: String, value: Binding<Double>) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(title)
+                Spacer()
+                Text("\(Int((value.wrappedValue * 100).rounded()))%")
+                    .monospacedDigit().foregroundStyle(.secondary)
+            }.font(.caption)
+            Slider(value: value, in: 0...1, step: 0.01)
+                .accessibilityLabel(title + "颜色深度")
+        }
+    }
+}
+
+struct KeepaliveActivitySection: View {
     @EnvironmentObject var s: Store
 
     // 只在“被周限拦下”时给一行说明——否则用户会以为保活坏了。平时不占位。
@@ -109,104 +309,16 @@ struct ControlSections: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if let t = blockedText {
-                Text(t).font(.caption).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 8) {
+            Text("保活记录").font(.headline)
+            if let text = blockedText {
+                Text(text).font(.caption).foregroundStyle(.secondary)
             }
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("保活")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .padding(.leading, 4)
-                HStack(spacing: 8) {
-                    KeepAliveToggleCard(title: "Claude", mark: "C", isOn: $s.claudeAutoEnabled)
-                    KeepAliveToggleCard(title: "Codex", mark: ">_", isOn: $s.codexAutoEnabled)
-                }
-                HStack(spacing: 10) {
-                    Text("交叉保活").font(.caption)
-                    Spacer(minLength: 0)
-                    Menu {
-                        ForEach(Array(stride(from: 30, through: 145, by: 5)), id: \.self) { minutes in
-                            Button {
-                                s.crossIntervalMinutes = Double(minutes)
-                            } label: {
-                                if Int(s.crossIntervalMinutes) == minutes {
-                                    Label("\(minutes) 分钟", systemImage: "checkmark")
-                                } else {
-                                    Text("\(minutes) 分钟")
-                                }
-                            }
-                        }
-                    } label: {
-                        Text("间隔＞\(Int(s.crossIntervalMinutes)) 分钟").font(.caption)
-                    }
-                    .menuStyle(.borderlessButton)
-                    .fixedSize()
-                    .accessibilityLabel("交叉保活间隔")
-                    .accessibilityValue("大于 \(Int(s.crossIntervalMinutes)) 分钟")
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.16)) {
-                            s.crossKeepaliveEnabled.toggle()
-                        }
-                    } label: {
-                        ToggleCheckmark(isOn: s.crossKeepaliveEnabled, compact: true)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("交叉保活")
-                    .accessibilityValue(s.crossKeepaliveEnabled ? "已开启" : "已关闭")
-                }
-                .padding(.horizontal, 11)
-                .frame(height: 42)
-                .background(s.crossKeepaliveEnabled ? Color.accentColor.opacity(0.055) : Color.clear)
-                if s.crossKeepaliveEnabled {
-                    Text(s.crossStatus)
-                        .font(.caption2).foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+            if s.busyFiring {
+                Text("保活中…").font(.caption).foregroundStyle(.secondary)
             }
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("应用")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .padding(.leading, 4)
-                VStack(spacing: 0) {
-                    SettingsToggleRow(title: "开机自启", isOn: Binding(
-                        get: { s.launchAtLogin },
-                        set: { s.setLaunchAtLogin($0) }
-                    ))
-                    Divider().padding(.leading, 11)
-                    SettingsToggleRow(title: "自动查询", isOn: $s.autoQueryOnOpen)
-                    Divider().padding(.leading, 11)
-                    SettingsToggleRow(title: "自动排序", isOn: $s.automaticSorting)
-                        .help("优先显示 5 小时内较早到期的 AI；用满后切换到仍有额度的 AI。关闭后恢复手动顺序。")
-                    Divider().padding(.leading, 11)
-                    SettingsToggleRow(title: "隐藏倒计时", isOn: $s.hideCountdown)
-                }
-                .background(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(Color.primary.opacity(0.035))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .strokeBorder(Color.secondary.opacity(0.18), lineWidth: 1)
-                )
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            }
-
-            HStack(spacing: 8) {
-                Button(s.paused ? "恢复" : "暂停") { s.togglePause() }
-                Button("刷新") { s.refreshNow() }.disabled(s.paused)
-                if s.busyFiring {
-                    Text("保活中…").font(.caption2).foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button("退出") { NSApp.terminate(nil) }
-            }
-
             if !s.lastFireResult.isEmpty {
-                Text(s.lastFireResult).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+                Text(s.lastFireResult).font(.caption2).foregroundStyle(.secondary)
             }
             if let lf = s.lastFire {
                 Text("上次 Claude 保活：\(localMDHM(lf))").font(.caption2).foregroundStyle(.secondary)
@@ -215,10 +327,11 @@ struct ControlSections: View {
                 Text("上次 Codex 保活：\(localMDHM(lf))").font(.caption2).foregroundStyle(.secondary)
             }
             if !s.codexLastFireResult.isEmpty {
-                Text(s.codexLastFireResult).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+                Text(s.codexLastFireResult).font(.caption2).foregroundStyle(.secondary)
             }
-            if let e = s.lastError {
-                Text(e).font(.caption2).foregroundStyle(.red).lineLimit(2)
+            if s.lastFire == nil && s.codexLastFire == nil
+                && s.lastFireResult.isEmpty && s.codexLastFireResult.isEmpty {
+                Text("暂无保活记录").font(.caption).foregroundStyle(.secondary)
             }
         }
     }

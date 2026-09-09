@@ -66,6 +66,7 @@ extension Store {
     // 刷日志直到你自己跑一次 codex 或重新登录。这是刻意的：宁可吵，也不要"看起来正常"。
     func fireCodexDirect() async -> Bool {
         guard let auth = codexAuth() else {
+            codexLastFireFailed = true
             codexLastFireResult = "Codex 保活失败：~/.codex/auth.json 无可用登录态"
             log("CODEX FIRE direct 失败：~/.codex/auth.json 无可用登录态 —— 窗口未续")
             return false
@@ -97,6 +98,7 @@ extension Store {
                 let b = (String(data: data, encoding: .utf8) ?? "")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 let mins = Int(codexRetryIntervalSec / 60)
+                codexLastFireFailed = true
                 codexLastFireResult = "Codex 保活失败：直连 HTTP \(code)，约 \(mins) 分钟后重试"
                 log("CODEX FIRE direct HTTP \(code) —— 窗口未续（401 多半是登录态过期，跑一次 codex 或重新登录）: \(String(b.prefix(160)))")
                 return false
@@ -104,6 +106,7 @@ extension Store {
         } catch {
             let ns = error as NSError
             let mins = Int(codexRetryIntervalSec / 60)
+            codexLastFireFailed = true
             codexLastFireResult = "Codex 保活失败：\(error.localizedDescription)，约 \(mins) 分钟后重试"
             log("CODEX FIRE direct failed: \(ns.domain)#\(ns.code) \(error.localizedDescription) —— 窗口未续")
             return false
@@ -116,6 +119,7 @@ extension Store {
             if await readCodexUsageRemote(), !codexWindowClosed, let r = codexPrimaryReset { reset = r; break }
         }
         guard let reset else {
+            codexLastFireFailed = true
             codexLastFireResult = "⚠️ Codex 直连 HTTP 200 但 53s 内未见新窗口 —— 直连开窗可能已失效"
             log("CODEX FIRE direct HTTP 200 但 53s 内未见新窗口（closed=\(codexWindowClosed)）—— 直连开窗可能已失效，需要人工判断；临时退回：defaults write com.iu.keepalivebar directFire -bool false")
             return false
@@ -123,6 +127,7 @@ extension Store {
         let stamp = Date()
         codexLastFire = stamp
         preferences.set(stamp.timeIntervalSince1970, forKey: "codexLastFire")
+        codexLastFireFailed = false
         codexLastFireResult = "Codex 激活成功（直连，~30 tokens）：新窗口 \(fmt(reset)) 重置"
         log("CODEX FIRED direct -> 新窗口 reset=\(fmt(reset))")
         return true
@@ -134,6 +139,7 @@ extension Store {
         do {
             temporaryDirectory = try makeTemporaryKeepaliveDirectory()
         } catch {
+            codexLastFireFailed = true
             codexLastFireResult = "Codex 保活失败：无法创建临时目录（\(error.localizedDescription)）"
             log("CODEX FAILED: 无法创建临时目录：\(error.localizedDescription)")
             return
@@ -174,10 +180,12 @@ extension Store {
             let stamp = Date()
             codexLastFire = stamp
             preferences.set(stamp.timeIntervalSince1970, forKey: "codexLastFire")
+            codexLastFireFailed = false
             codexLastFireResult = "Codex 激活成功：\(String(trimmed.prefix(60)))"
             log("CODEX FIRED -> \(String(trimmed.prefix(120)))")
         } else {
             let mins = Int(codexRetryIntervalSec / 60)
+            codexLastFireFailed = true
             codexLastFireResult = "Codex 激活失败 (rc=\(r.code))，约 \(mins) 分钟后重试：\(String(trimmed.prefix(80)))"
             log("CODEX FAILED rc=\(r.code) (retry in \(mins)m): \(String(trimmed.prefix(180)))")
         }

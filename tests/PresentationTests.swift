@@ -1,7 +1,16 @@
 import Foundation
+import AppKit
 
 extension TestSuite {
     func testPresentation() {
+        let image = MenuBarCountdown.label(icon: nil, iconKey: "test", title: "2h00m", percent: 50)!
+        let same = MenuBarCountdown.label(icon: nil, iconKey: "test", title: "2h00m", percent: 50)!
+        check(image === same, "unchanged menu label reuses cache")
+        let faded = MenuBarCountdown.label(icon: nil, iconKey: "test", title: "2h00m", percent: 50, fillOpacity: 0.4)!
+        check(image !== faded && image.size == faded.size, "fill depth invalidates cache without changing layout")
+        let track = MenuBarCountdown.label(icon: nil, iconKey: "test", title: "2h00m", percent: 50, fillOpacity: 0.4, trackOpacity: 0.6)!
+        check(faded !== track, "track depth independently invalidates cache")
+        check(track.tiffRepresentation != nil, "configured menu label renders successfully")
         let s = Store(preferences: defaults, monitoring: false)
         let soon = base.addingTimeInterval(3600)
         let later = base.addingTimeInterval(7200)

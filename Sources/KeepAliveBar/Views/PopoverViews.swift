@@ -2,13 +2,19 @@ import SwiftUI
 
 // 点击菜单栏图标弹出的主界面
 struct ContentView: View {
+    @State private var showingSettings = false
     @EnvironmentObject var s: Store
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            UsageSections(allowsReordering: true)
-            Divider()
-            ControlSections()
+            if showingSettings {
+                AppSettingsView(close: { showingSettings = false })
+                    .frame(height: 540)
+            } else {
+                UsageSections(allowsReordering: true)
+                Divider()
+                ControlSections(openSettings: { showingSettings = true })
+            }
         }
         .padding(14)
         .frame(width: 300)

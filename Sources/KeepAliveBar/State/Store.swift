@@ -54,12 +54,14 @@ final class Store: ObservableObject {
     // "窗口关着"和"没记录"，那条路走时间兜底）。为 true 时该立刻开火，而不是等 codexPrimaryReset。
     @Published var codexWindowClosed = false
     @Published var codexLastFire: Date?
+    @Published var codexLastFireFailed = false
     @Published var codexLastFireResult: String = ""
     @Published var claudeLoginExpiresAt: Date?
     var lastLoginExpiryCheck: Date?
     var checkingLoginExpiry = false
     @Published var lastError: String?
     @Published var lastFire: Date?
+    @Published var lastFireFailed = false
     @Published var lastFireResult: String = ""
     @Published var busyFiring = false
     @Published var now: Date = Date()
@@ -86,6 +88,28 @@ final class Store: ObservableObject {
     @Published var hideCountdown: Bool {                          // 隐藏倒计时：菜单栏只留图标
         didSet { preferences.set(hideCountdown, forKey: "hideCountdown") }
     }
+    @Published var visibleMenuControls: [String] {
+        didSet { preferences.set(visibleMenuControls, forKey: "visibleMenuControls") }
+    }
+    func showsMenuControl(_ control: MenuControl) -> Bool {
+        visibleMenuControls.contains(control.rawValue)
+    }
+    func setMenuControl(_ control: MenuControl, visible: Bool) {
+        visibleMenuControls.removeAll { $0 == control.rawValue }
+        if visible { visibleMenuControls.append(control.rawValue) }
+    }
+
+    @Published var menuBarFillOpacity: Double {
+        didSet { preferences.set(menuBarFillOpacity, forKey: "menuBarFillOpacity") }
+    }
+    @Published var menuBarTrackOpacity: Double {
+        didSet { preferences.set(menuBarTrackOpacity, forKey: "menuBarTrackOpacity") }
+    }
+
+    static func normalizedOpacity(_ value: Double, fallback: Double) -> Double {
+        value.isFinite ? min(1, max(0, value)) : fallback
+    }
+
     @Published var popupOpen = false                              // 主弹窗是否正开着（悬停快照据此避让，见 HoverSnapshot）
     @Published var codexFirst: Bool {
         didSet { preferences.set(codexFirst, forKey: "codexFirst") }
@@ -171,6 +195,11 @@ final class Store: ObservableObject {
         }
         self.paused = preferences.bool(forKey: "paused")   // 默认 false
         self.autoQueryOnOpen = (preferences.object(forKey: "autoQueryOnOpen") as? Bool) ?? true
+        self.visibleMenuControls = preferences.stringArray(forKey: "visibleMenuControls") ?? []
+        self.menuBarFillOpacity = Self.normalizedOpacity(
+            (preferences.object(forKey: "menuBarFillOpacity") as? Double) ?? 1, fallback: 1)
+        self.menuBarTrackOpacity = Self.normalizedOpacity(
+            (preferences.object(forKey: "menuBarTrackOpacity") as? Double) ?? 0.22, fallback: 0.22)
         self.hideCountdown = preferences.bool(forKey: "hideCountdown")   // 默认 false（显示倒计时）
         if let t = preferences.object(forKey: "windowEnd") as? Double {
             self.windowEnd = Date(timeIntervalSince1970: t)

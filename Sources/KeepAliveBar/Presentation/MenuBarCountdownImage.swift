@@ -14,7 +14,8 @@ enum MenuBarCountdown {
     // body 每 5 秒 tick 都会重算；键相同就复用同一个 NSImage，状态项不会因为换实例而重排宽度。
     private static var cache: (key: String, image: NSImage)?
 
-    static func label(icon: NSImage?, iconKey: String, title: String, percent: Double?) -> NSImage? {
+    static func label(icon: NSImage?, iconKey: String, title: String, percent: Double?,
+                      fillOpacity: Double = 1, trackOpacity: Double = 0.22) -> NSImage? {
         guard icon != nil || !title.isEmpty else { return nil }
         // 颜色必须在 drawingHandler 之外按菜单栏外观解析好：handler 是延迟执行的，
         // 里面的 NSColor.labelColor 会跟着“当时的绘制外观”走，浅色/深色切换时容易画反。
@@ -22,9 +23,11 @@ enum MenuBarCountdown {
         // 在 Swift 6 语言模式下会变成硬错误。
         let (gap, inset, barHeight, barGap) = (Self.gap, Self.inset, Self.barHeight, Self.barGap)
         let appearance = NSApp?.effectiveAppearance ?? .currentDrawing()
+        let fillOpacity = Store.normalizedOpacity(fillOpacity, fallback: 1)
+        let trackOpacity = Store.normalizedOpacity(trackOpacity, fallback: 0.22)
         let fraction = percent.map { min(1, max(0, $0 / 100)) }
         // 键里把比例量化到 0.25%：文字没变、用量只抖动零点几个百分点时复用同一个 NSImage。
-        let key = "\(iconKey)|\(title)|\(fraction.map { Int(($0 * 400).rounded()) } ?? -1)|\(appearance.name.rawValue)"
+        let key = "\(iconKey)|\(title)|\(fraction.map { Int(($0 * 400).rounded()) } ?? -1)|\(appearance.name.rawValue)|\(fillOpacity)|\(trackOpacity)"
         if let cached = cache, cached.key == key { return cached.image }
 
         let font = NSFont.menuBarFont(ofSize: 0)
@@ -35,9 +38,10 @@ enum MenuBarCountdown {
             fillColor = fillColor.usingColorSpace(.sRGB) ?? fillColor
         }
 
+        fillColor = fillColor.withAlphaComponent(fillOpacity)
         let base = title.isEmpty ? nil : NSAttributedString(
             string: title, attributes: [.font: font, .foregroundColor: baseColor])
-        let trackColor = baseColor.withAlphaComponent(0.22)
+        let trackColor = baseColor.withAlphaComponent(trackOpacity)
         let textSize = base?.size() ?? .zero
         let textWidth = base == nil ? 0 : ceil(textSize.width) + inset * 2
         let iconSize = icon?.size ?? .zero
@@ -81,6 +85,7 @@ extension Store {
         let codex = displayedCodexFirst
         return MenuBarCountdown.label(icon: codex ? MenuBarArtwork.codex : MenuBarArtwork.clawd,
                                       iconKey: codex ? "codex" : "clawd",
-                                      title: menuTitle, percent: menuUsagePercent)
+                                      title: menuTitle, percent: menuUsagePercent,
+                                      fillOpacity: menuBarFillOpacity, trackOpacity: menuBarTrackOpacity)
     }
 }

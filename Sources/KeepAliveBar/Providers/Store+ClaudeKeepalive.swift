@@ -26,6 +26,7 @@ extension Store {
             cred = await readCredential()
         }
         guard let tok = cred.accessToken, !tokenNeedsRefresh(cred.expiresAtMs) else {
+            lastFireFailed = true
             lastFireResult = "Claude 保活失败：无可用 token（\(cred.diag)），需重新登录 claude"
             log("FIRE direct 失败：无可用 token（\(cred.diag)）—— 窗口未续")
             return false
@@ -51,6 +52,7 @@ extension Store {
                 let b = (String(data: data, encoding: .utf8) ?? "")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 let mins = Int(retryIntervalSec / 60)
+                lastFireFailed = true
                 lastFireResult = "Claude 保活失败：直连 HTTP \(code)，约 \(mins) 分钟后重试"
                 log("FIRE direct HTTP \(code) tokenExp=\(tokenExpStr(cred.expiresAtMs)) —— 窗口未续: \(String(b.prefix(160)))")
                 return false
@@ -58,6 +60,7 @@ extension Store {
         } catch {
             let ns = error as NSError
             let mins = Int(retryIntervalSec / 60)
+            lastFireFailed = true
             lastFireResult = "Claude 保活失败：\(error.localizedDescription)，约 \(mins) 分钟后重试"
             log("FIRE direct failed: \(ns.domain)#\(ns.code) \(error.localizedDescription) —— 窗口未续")
             return false
@@ -74,6 +77,7 @@ extension Store {
             if let e = windowEnd, e.timeIntervalSinceNow > 0 { end = e; break }
         }
         guard let end else {
+            lastFireFailed = true
             lastFireResult = "⚠️ Claude 直连 HTTP 200 但 125s 内未见新窗口 —— 直连开窗可能已失效"
             log("FIRE direct HTTP 200 但 125s 内未见新窗口（windowEnd=\(fmt(windowEnd)) rawReset=\(fmt(fiveReset))）—— 直连开窗可能已失效，需要人工判断；临时退回：defaults write com.iu.keepalivebar directFire -bool false")
             return false
@@ -81,6 +85,7 @@ extension Store {
         let stamp = Date()
         lastFire = stamp
         preferences.set(stamp.timeIntervalSince1970, forKey: "lastFire")
+        lastFireFailed = false
         lastFireResult = "Claude 保活成功（直连，~8 tokens）：新窗口 \(fmt(end)) 重置"
         log("FIRED direct -> 新窗口 windowEnd=\(fmt(end))")
         return true
@@ -92,6 +97,7 @@ extension Store {
         do {
             temporaryDirectory = try makeTemporaryKeepaliveDirectory()
         } catch {
+            lastFireFailed = true
             lastFireResult = "Claude 保活失败：无法创建临时目录（\(error.localizedDescription)）"
             log("FAILED: 无法创建临时目录：\(error.localizedDescription)")
             return
@@ -111,11 +117,13 @@ extension Store {
             let stamp = Date()
             lastFire = stamp
             preferences.set(stamp.timeIntervalSince1970, forKey: "lastFire")
+            lastFireFailed = false
             lastFireResult = "Claude 保活成功：\(String(trimmed.prefix(60)))"
             log("FIRED -> \(String(trimmed.prefix(100)))")
         } else {
             // 失败：不更新 lastFire（窗口仍算未续），lastAttempt 已记 → retryIntervalSec 后自动重试
             let mins = Int(retryIntervalSec / 60)
+            lastFireFailed = true
             lastFireResult = "Claude 保活失败 (rc=\(r.code))，约 \(mins) 分钟后自动重试：\(String(trimmed.prefix(80)))"
             log("FAILED rc=\(r.code) (retry in \(mins)m): \(String(trimmed.prefix(160)))")
         }
