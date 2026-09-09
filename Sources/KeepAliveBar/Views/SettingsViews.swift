@@ -97,16 +97,19 @@ struct SettingsToggleRow: View {
 // 首页仅显示快捷操作和错误；保活记录与一般状态放在设置中。
 struct ControlSections: View {
     @EnvironmentObject var s: Store
+    var settingsExpanded: Bool
     var openSettings: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            FeatureControls(settings: false)
+            FeatureControls(hidden: false)
 
             HStack(spacing: 8) {
                 Button(s.paused ? "恢复" : "暂停") { s.togglePause() }
                 Button("刷新") { s.refreshNow() }.disabled(s.paused)
                 Button("设置", action: openSettings)
+                .accessibilityLabel(settingsExpanded ? "收起设置" : "展开设置")
+                .accessibilityValue(settingsExpanded ? "已展开" : "已收起")
                 Spacer()
                 Button("退出") { NSApp.terminate(nil) }
             }
@@ -126,10 +129,10 @@ struct ControlSections: View {
 
 struct FeatureControls: View {
     @EnvironmentObject var s: Store
-    var settings: Bool
+    var hidden: Bool
 
     private func includes(_ control: MenuControl) -> Bool {
-        settings || s.showsMenuControl(control)
+        s.menuControls(hidden: hidden).contains(control)
     }
 
     var body: some View {
@@ -185,11 +188,6 @@ struct FeatureControls: View {
                         .padding(.horizontal, 11)
                         .frame(height: 42)
                         .background(s.crossKeepaliveEnabled ? Color.accentColor.opacity(0.055) : Color.clear)
-                        if settings && s.crossKeepaliveEnabled {
-                            Text(s.crossStatus)
-                                .font(.caption2).foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
                     }
                 }
 
@@ -234,49 +232,47 @@ struct FeatureControls: View {
 
 struct AppSettingsView: View {
     @EnvironmentObject var s: Store
-    var close: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text("设置").font(.headline)
-                Spacer()
-                Button("返回", action: close)
+        VStack(alignment: .leading, spacing: 16) {
+            if !s.menuControls(hidden: true).isEmpty {
+                Text("已隐藏的控件").font(.headline)
+                FeatureControls(hidden: true)
+                Divider()
+            }
+            Text("控件显示").font(.headline)
+            Text("勾选后在上方显示；取消勾选则移入已隐藏的控件，不会关闭功能。")
+                .font(.caption).foregroundStyle(.secondary)
+            VStack(spacing: 0) {
+                ForEach(MenuControl.allCases) { control in
+                    SettingsToggleRow(
+                        title: control.title,
+                        isOn: Binding(
+                            get: { s.showsMenuControl(control) },
+                            set: { s.setMenuControl(control, visible: $0) }))
+                        .accessibilityLabel(control.title + "在首页显示")
+                        .accessibilityValue(s.showsMenuControl(control) ? "已显示" : "已隐藏")
+                }
             }
             Divider()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    KeepaliveActivitySection()
-                    Divider()
-                    FeatureControls(settings: true)
-                    Divider()
-                    Text("菜单栏弹窗显示").font(.headline)
-                    Text("选择在首页显示的快捷开关。隐藏不会关闭功能，仍可在设置中操作。")
-                        .font(.caption).foregroundStyle(.secondary)
-                    ForEach(MenuControl.allCases) { control in
-                        SettingsToggleRow(
-                            title: control.title,
-                            isOn: Binding(
-                                get: { s.showsMenuControl(control) },
-                                set: { s.setMenuControl(control, visible: $0) }))
-                    }
-                    Divider()
-                    Text("菜单栏进度条").font(.headline)
-                    Text("颜色深度越高，颜色越浓；0% 为透明。")
-                        .font(.caption).foregroundStyle(.secondary)
-                    opacitySlider("填充色", value: $s.menuBarFillOpacity)
-                    opacitySlider("底色", value: $s.menuBarTrackOpacity)
-                    ZStack(alignment: .leading) {
-                        Capsule().fill(Color.primary.opacity(s.menuBarTrackOpacity))
-                        Capsule().fill(Color.green.opacity(s.menuBarFillOpacity)).frame(width: 140)
-                    }
-                    .frame(height: 4)
-                    .accessibilityLabel("进度条颜色预览，已用约一半")
-                    Button("恢复默认深度") {
-                        s.menuBarFillOpacity = 1
-                        s.menuBarTrackOpacity = 0.22
-                    }
-                }.padding(.trailing, 4)
+            if !s.crossKeepaliveEnabled {
+                KeepaliveActivitySection()
+                Divider()
+            }
+            Text("菜单栏进度条").font(.headline)
+            Text("颜色深度越高，颜色越浓；0% 为透明。")
+                .font(.caption).foregroundStyle(.secondary)
+            opacitySlider("填充色", value: $s.menuBarFillOpacity)
+            opacitySlider("底色", value: $s.menuBarTrackOpacity)
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.primary.opacity(s.menuBarTrackOpacity))
+                Capsule().fill(Color.green.opacity(s.menuBarFillOpacity)).frame(width: 140)
+            }
+            .frame(height: 4)
+            .accessibilityLabel("进度条颜色预览，已用约一半")
+            Button("恢复默认深度") {
+                s.menuBarFillOpacity = 1
+                s.menuBarTrackOpacity = 0.22
             }
         }
     }
@@ -310,29 +306,55 @@ struct KeepaliveActivitySection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("保活记录").font(.headline)
             if let text = blockedText {
                 Text(text).font(.caption).foregroundStyle(.secondary)
             }
             if s.busyFiring {
                 Text("保活中…").font(.caption).foregroundStyle(.secondary)
             }
-            if !s.lastFireResult.isEmpty {
-                Text(s.lastFireResult).font(.caption2).foregroundStyle(.secondary)
-            }
-            if let lf = s.lastFire {
-                Text("上次 Claude 保活：\(localMDHM(lf))").font(.caption2).foregroundStyle(.secondary)
-            }
-            if let lf = s.codexLastFire {
-                Text("上次 Codex 保活：\(localMDHM(lf))").font(.caption2).foregroundStyle(.secondary)
-            }
-            if !s.codexLastFireResult.isEmpty {
-                Text(s.codexLastFireResult).font(.caption2).foregroundStyle(.secondary)
+            ForEach(s.displayedCodexFirst ? [true, false] : [false, true], id: \.self) { codex in
+                let title = codex ? "Codex" : "Claude"
+                let lastFire = codex ? s.codexLastFire : s.lastFire
+                let result = codex ? s.codexLastFireResult : s.lastFireResult
+                if let lastFire {
+                    Text("上次 \(title) 保活：\(localMDHM(lastFire))")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                if !result.isEmpty {
+                    Text(result).font(.caption2).foregroundStyle(.secondary)
+                }
             }
             if s.lastFire == nil && s.codexLastFire == nil
-                && s.lastFireResult.isEmpty && s.codexLastFireResult.isEmpty {
+                && s.lastFireResult.isEmpty && s.codexLastFireResult.isEmpty
+            {
                 Text("暂无保活记录").font(.caption).foregroundStyle(.secondary)
             }
         }
+    }
+}
+
+// 开启交叉保活后，时间摘要始终留在用量下方，不受快捷开关是否隐藏影响。
+struct CrossKeepaliveTimingView: View {
+    @EnvironmentObject var s: Store
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Label("交叉保活", systemImage: "clock.arrow.2.circlepath")
+                    .font(.caption.weight(.semibold))
+                Spacer(minLength: 4)
+                Text("间隔＞\(Int(s.crossIntervalMinutes)) 分钟")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            Text(s.crossStatus)
+                .font(.caption).fixedSize(horizontal: false, vertical: true)
+            Divider()
+            KeepaliveActivitySection()
+        }
+        .font(.caption2)
+        .foregroundStyle(.secondary)
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.accentColor.opacity(0.055)))
     }
 }

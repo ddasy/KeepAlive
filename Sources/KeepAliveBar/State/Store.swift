@@ -94,6 +94,11 @@ final class Store: ObservableObject {
     func showsMenuControl(_ control: MenuControl) -> Bool {
         visibleMenuControls.contains(control.rawValue)
     }
+    // 两个区域使用同一份配置分组，并保持原始控件顺序。
+    func menuControls(hidden: Bool) -> [MenuControl] {
+        MenuControl.allCases.filter { showsMenuControl($0) != hidden }
+    }
+
     func setMenuControl(_ control: MenuControl, visible: Bool) {
         visibleMenuControls.removeAll { $0 == control.rawValue }
         if visible { visibleMenuControls.append(control.rawValue) }
@@ -195,7 +200,9 @@ final class Store: ObservableObject {
         }
         self.paused = preferences.bool(forKey: "paused")   // 默认 false
         self.autoQueryOnOpen = (preferences.object(forKey: "autoQueryOnOpen") as? Bool) ?? true
-        self.visibleMenuControls = preferences.stringArray(forKey: "visibleMenuControls") ?? []
+        // 缺少配置才恢复原始的全部显示布局；已保存的空数组代表全部隐藏。
+        self.visibleMenuControls = preferences.stringArray(forKey: "visibleMenuControls")
+            ?? MenuControl.allCases.map(\.rawValue)
         self.menuBarFillOpacity = Self.normalizedOpacity(
             (preferences.object(forKey: "menuBarFillOpacity") as? Double) ?? 1, fallback: 1)
         self.menuBarTrackOpacity = Self.normalizedOpacity(
