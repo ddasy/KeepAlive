@@ -25,7 +25,10 @@ extension Store {
         return CrossKeepalivePolicy.deferredUntil(
             now: Date(),
             otherStart: crossWindowStart(claude: !claude),
-            minutes: crossIntervalMinutes)
+            minutes: crossIntervalMinutes,
+            // Claude 侧按服务端网格对齐等待目标，否则开火时刻被向下取整、实际起点差恒小于阈值
+            //（实测卡死在 1h50m）。Codex 的窗口起点等于开火时刻，无需对齐。
+            gridAnchor: claude ? windowEnd : nil)
     }
 
     func crossAllowsFire(claude: Bool) -> Bool {
