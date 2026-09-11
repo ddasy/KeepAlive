@@ -28,7 +28,7 @@ cat > "$STAGE/Contents/Info.plist" <<PLIST
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>            <string>KeepAliveBar</string>
-    <key>CFBundleDisplayName</key>     <string>Claude 保活</string>
+    <key>CFBundleDisplayName</key>     <string>KeepAliveBar</string>
     <key>CFBundleIdentifier</key>      <string>$BUNDLE_ID</string>
     <key>CFBundleVersion</key>         <string>1.0</string>
     <key>CFBundleShortVersionString</key><string>1.0</string>
