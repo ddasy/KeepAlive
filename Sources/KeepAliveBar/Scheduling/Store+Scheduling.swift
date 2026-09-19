@@ -22,9 +22,19 @@ extension Store {
 
     func crossWaitUntil(claude: Bool) -> Date? {
         guard crossActive else { return nil }
+        let now = Date()
+        let otherStart = crossWindowStart(claude: !claude)
+        if crossCentered {
+            return CrossKeepalivePolicy.centeredDeferredUntil(
+                now: now,
+                otherStart: otherStart,
+                // Claude 侧服务端会把开火时刻向下取整到半小时网格；居中模式取最近网格，
+                // 已经过了该网格时则立即开火，避免稳态每轮白等 30 分钟。
+                gridAnchor: claude ? windowEnd : nil)
+        }
         return CrossKeepalivePolicy.deferredUntil(
-            now: Date(),
-            otherStart: crossWindowStart(claude: !claude),
+            now: now,
+            otherStart: otherStart,
             minutes: crossIntervalMinutes,
             // Claude 侧按服务端网格对齐等待目标，否则开火时刻被向下取整、实际起点差恒小于阈值
             //（实测卡死在 1h50m）。Codex 的窗口起点等于开火时刻，无需对齐。
@@ -36,7 +46,10 @@ extension Store {
         let who = claude ? "Claude" : "Codex"
         if lastCrossWaitLog[who] != until {
             lastCrossWaitLog[who] = until
-            log("CROSS \(who) 交叉保活：延后至 \(fmt(until))，间隔须大于 \(Int(crossIntervalMinutes)) 分钟")
+            let spacing = crossCentered
+                ? "间隔尽量接近 150 分钟"
+                : "间隔须大于 \(Int(crossIntervalMinutes)) 分钟"
+            log("CROSS \(who) 交叉保活：延后至 \(fmt(until))，\(spacing)")
         }
         return false
     }

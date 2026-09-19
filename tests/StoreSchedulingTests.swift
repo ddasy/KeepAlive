@@ -4,6 +4,7 @@ extension TestSuite {
     func testStoreScheduling() {
         let s = Store(preferences: defaults, monitoring: false)
         check(!s.codexFirst, "fresh install keeps Claude first")
+        check(!s.crossCentered, "fresh install keeps threshold mode")
         s.codexFirst = true
         check(Store(preferences: defaults, monitoring: false).codexFirst, "Codex-first order survives restart")
         s.codexFirst = false
@@ -18,6 +19,11 @@ extension TestSuite {
         s.codexWindowClosed = true
         check(s.crossWaitUntil(claude: false) != nil, "Codex defers against Claude server window")
         check(s.crossWaitUntil(claude: true) == nil, "first side has no counterpart anchor")
+        s.crossCentered = true
+        let centeredDeadline = s.crossWaitUntil(claude: false)!
+        check(abs(centeredDeadline.timeIntervalSince(current.addingTimeInterval(90 * 60))) < 1,
+              "centered scheduling targets 150 minutes from the other window start")
+        s.crossCentered = false
         s.windowEnd = current.addingTimeInterval(2 * 3600)
         check(s.crossWaitUntil(claude: false) == nil, "three-hour gap allowed")
         s.windowEnd = current.addingTimeInterval(4.5 * 3600)
@@ -41,6 +47,11 @@ extension TestSuite {
         check(restored.crossKeepaliveEnabled && restored.crossIntervalMinutes == 120, "settings persist")
         check(restored.crossWaitUntil(claude: true) != nil, "Codex anchor survives restart")
         check(restored.crossWaitUntil(claude: false) != nil, "Claude anchor survives restart")
+        s.crossCentered = true
+        let centeredRestored = Store(preferences: defaults, monitoring: false)
+        check(centeredRestored.crossCentered && centeredRestored.crossIntervalMinutes == 120,
+              "centered mode persists without changing the saved minute threshold")
+        s.crossCentered = false
         let statusStore = Store(preferences: defaults, monitoring: false)
         statusStore.paused = false
         statusStore.claudeAutoEnabled = true

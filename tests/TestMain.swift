@@ -20,6 +20,7 @@ final class TestSuite {
         testPreferences()
         reset()
         testCrossKeepalivePolicy()
+        testCenteredCrossKeepalivePolicy()
         testPresentation()
         reset()
         testStoreScheduling()

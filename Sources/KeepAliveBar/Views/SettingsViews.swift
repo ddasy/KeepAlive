@@ -156,11 +156,22 @@ struct FeatureControls: View {
                             Text("交叉保活").font(.caption)
                             Spacer(minLength: 0)
                             Menu {
+                                Button {
+                                    s.crossCentered = true
+                                } label: {
+                                    if s.crossCentered {
+                                        Label("居中", systemImage: "checkmark")
+                                    } else {
+                                        Text("居中")
+                                    }
+                                }
+                                Divider()
                                 ForEach(Array(stride(from: 30, through: 145, by: 5)), id: \.self) { minutes in
                                     Button {
+                                        s.crossCentered = false
                                         s.crossIntervalMinutes = Double(minutes)
                                     } label: {
-                                        if Int(s.crossIntervalMinutes) == minutes {
+                                        if !s.crossCentered && Int(s.crossIntervalMinutes) == minutes {
                                             Label("\(minutes) 分钟", systemImage: "checkmark")
                                         } else {
                                             Text("\(minutes) 分钟")
@@ -168,12 +179,13 @@ struct FeatureControls: View {
                                     }
                                 }
                             } label: {
-                                Text("间隔＞\(Int(s.crossIntervalMinutes)) 分钟").font(.caption)
+                                Text(s.crossCentered ? "居中" : "间隔＞\(Int(s.crossIntervalMinutes)) 分钟")
+                                    .font(.caption)
                             }
                             .menuStyle(.borderlessButton)
                             .fixedSize()
                             .accessibilityLabel("交叉保活间隔")
-                            .accessibilityValue("大于 \(Int(s.crossIntervalMinutes)) 分钟")
+                            .accessibilityValue(s.crossCentered ? "居中，约 2 小时 30 分钟" : "大于 \(Int(s.crossIntervalMinutes)) 分钟")
                             Button {
                                 withAnimation(.easeInOut(duration: 0.16)) {
                                     s.crossKeepaliveEnabled.toggle()
@@ -343,7 +355,7 @@ struct CrossKeepaliveTimingView: View {
                 Label("交叉保活", systemImage: "clock.arrow.2.circlepath")
                     .font(.caption.weight(.semibold))
                 Spacer(minLength: 4)
-                Text("间隔＞\(Int(s.crossIntervalMinutes)) 分钟")
+                Text(s.crossCentered ? "居中 ≈2h30m" : "间隔＞\(Int(s.crossIntervalMinutes)) 分钟")
                     .font(.caption2).foregroundStyle(.secondary)
             }
             Text(s.crossStatus)

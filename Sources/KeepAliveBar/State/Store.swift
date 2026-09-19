@@ -75,6 +75,9 @@ final class Store: ObservableObject {
     @Published var crossKeepaliveEnabled: Bool {
         didSet { preferences.set(crossKeepaliveEnabled, forKey: "crossKeepaliveEnabled") }
     }
+    @Published var crossCentered: Bool {
+        didSet { preferences.set(crossCentered, forKey: "crossCentered") }
+    }
     @Published var crossIntervalMinutes: Double {
         didSet { preferences.set(CrossKeepalivePolicy.minutes(crossIntervalMinutes), forKey: "crossIntervalMinutes") }
     }
@@ -193,6 +196,7 @@ final class Store: ObservableObject {
         self.claudeAutoEnabled = (preferences.object(forKey: "claudeAutoEnabled") as? Bool) ?? legacyAuto
         self.codexAutoEnabled = (preferences.object(forKey: "codexAutoEnabled") as? Bool) ?? legacyAuto
         self.crossKeepaliveEnabled = preferences.bool(forKey: "crossKeepaliveEnabled")
+        self.crossCentered = preferences.bool(forKey: "crossCentered")
         self.crossIntervalMinutes = CrossKeepalivePolicy.minutes(
             (preferences.object(forKey: "crossIntervalMinutes") as? Double) ?? 120)
         if let t = preferences.object(forKey: "codexCrossWindowEnd") as? Double {
