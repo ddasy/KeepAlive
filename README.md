@@ -60,13 +60,37 @@ Settings expand in place beneath the main view: hidden controls keep working and
 
 ## 🚀 Installation
 
-### Option 1 — Menu bar app (recommended)
+Three ways to install the menu bar app. All of them put it at `/Applications/KeepAliveBar.app`, so **update the same way you installed** (or any other way). There's no need to uninstall first, your settings are kept, and you never end up with two copies.
+
+### Option A — DMG
+
+Download `KeepAliveBar-v<version>.dmg` from the [latest release](https://github.com/ddasy/KeepAlive/releases/latest), open it, and drag **KeepAliveBar.app** into **Applications**. When updating, quit the running copy first (menu bar → **Quit**) and choose **Replace**.
+
+> The app is ad-hoc signed but **not Apple-notarized**, so macOS may block the first launch. **Right-click the app → Open → Open**, or run:
+> ```bash
+> xattr -dr com.apple.quarantine /Applications/KeepAliveBar.app
+> ```
+> Turn on **Launch at Login** from the popover.
+
+### Option B — One-line installer
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ddasy/KeepAlive/main/install-app.sh | bash
+```
+
+This pulls the latest source, compiles it on your machine, installs the app, and registers the login item. Re-run the same command to update.
+
+### Option C — Cloned repo
 
 ```bash
 git clone https://github.com/ddasy/KeepAlive.git
 cd KeepAlive
 bash install-app.sh
 ```
+
+To update: `git pull && bash install-app.sh`.
+
+B and C compile on your own machine, so Gatekeeper never gets involved.
 
 `install-app.sh` compiles the app, installs it as `/Applications/KeepAliveBar.app`, pins a keepalive-only copy of the `claude` binary (so the keychain's "Always Allow" keeps working across CLI auto-updates), and registers a login item. The icon appears in the menu bar right away.
 
@@ -81,7 +105,7 @@ The build assembles the bundle in a temp directory and only swaps `/Applications
 Build somewhere else to try it out: `KA_DEST=/tmp/ka/KeepAliveBar.app bash build-app.sh`.
 Verify a build without installing: `KA_VERIFY_ONLY=1 bash build-app.sh`.
 
-### Option 2 — Headless launchd agent
+### Headless launchd agent (no UI)
 
 ```bash
 bash status.sh      # read-only: current usage and reset times, sends nothing
@@ -89,7 +113,7 @@ bash install.sh     # start the 24/7 background agent
 bash uninstall.sh   # stop and remove it
 ```
 
-> Run **one** of the two, not both — otherwise they'll both fire into the same account.
+> Run **either** the app or the agent, not both — otherwise they'll both fire into the same account.
 
 ## 🖱️ Usage
 
@@ -186,7 +210,7 @@ Environment variables, settable in the plist's `EnvironmentVariables`:
 ## 📋 Requirements
 
 - macOS 13 (Ventura) or later, Apple Silicon
-- Xcode Command Line Tools (`xcode-select --install`)
+- Xcode Command Line Tools (`xcode-select --install`), only for installing from source (options B / C); not needed for the DMG
 - Claude Code and/or Codex CLI, **logged in with a subscription account** (the OAuth credentials in your keychain are what this reads)
 
 ## ⚠️ Read this before you rely on it
@@ -214,7 +238,8 @@ Module layout, state constraints, and where new features belong: [docs/ARCHITECT
 | `Sources/KeepAliveBar/` | The menu bar app, split by state / policy / provider / presentation / views |
 | `scripts/swift-sources.sh` | The Swift source list shared by the build and the tests |
 | `build-app.sh` | Compile → assemble in a temp dir → atomically replace `/Applications/KeepAliveBar.app` and restart |
-| `install-app.sh` | `build-app.sh` + pinned `keepalive-claude` copy + login item |
+| `install-app.sh` | `build-app.sh` + pinned `keepalive-claude` copy + login item; also works as a `curl` one-liner |
+| `package.sh` | Build the release DMG: `bash package.sh <version>` → `KeepAliveBar-v<version>.dmg` |
 | `keepalive.sh` | The launchd core: read usage → decide → fire if needed |
 | `status.sh` | **Read-only** panel: usage, reset times, activation state. Safe to run anytime |
 | `com.iu.claude-keepalive.plist` | LaunchAgent template |

@@ -9,3 +9,6 @@ codex-state.json
 
 # macOS
 .DS_Store
+
+# 打包产物（package.sh）
+*.dmg

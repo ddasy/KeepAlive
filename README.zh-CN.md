@@ -60,13 +60,37 @@ Claude Code 和 Codex 的订阅都按 **5 小时窗口**计费：窗口从你发
 
 ## 🚀 安装
 
-### 方式一 · 菜单栏 App（推荐）
+菜单栏 App 有三种安装方式，都装到 `/Applications/KeepAliveBar.app`，所以**用当初的方式（或任意一种）更新即可**：不必先卸载，偏好设置会保留，也不会装出第二份。
+
+### 方式 A · DMG
+
+从[最新 Release](https://github.com/ddasy/KeepAlive/releases/latest) 下载 `KeepAliveBar-v<版本>.dmg`，打开后把 **KeepAliveBar.app** 拖进「应用程序」。更新时先在菜单栏点「退出」关掉正在运行的版本，再拖入并选择「替换」。
+
+> 本 App 为 ad-hoc 签名、**未经 Apple 公证**，首次打开可能被拦截：**右键点 App →「打开」→「打开」**，或执行：
+> ```bash
+> xattr -dr com.apple.quarantine /Applications/KeepAliveBar.app
+> ```
+> 开机自启请在弹窗里打开「开机自启」开关。
+
+### 方式 B · 一行命令安装
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ddasy/KeepAlive/main/install-app.sh | bash
+```
+
+拉取最新源码、在本机编译、安装并注册开机自启。更新时重跑同一条命令即可。
+
+### 方式 C · 克隆仓库安装
 
 ```bash
 git clone https://github.com/ddasy/KeepAlive.git
 cd KeepAlive
 bash install-app.sh
 ```
+
+更新：`git pull && bash install-app.sh`。
+
+B、C 都在本机编译，不会遇到 Gatekeeper 拦截。
 
 `install-app.sh` 会编译、安装到 `/Applications/KeepAliveBar.app`、生成保活专用的 `claude` 固定副本（身份不随 CLI 每日自动更新变化，让钥匙串「始终允许」长期有效），并注册开机自启登录项。菜单栏立刻出现 Clawd 图标。
 
@@ -81,7 +105,7 @@ bash build-app.sh
 想编译到别处试跑：`KA_DEST=/tmp/ka/KeepAliveBar.app bash build-app.sh`。
 只验证构建、不安装：`KA_VERIFY_ONLY=1 bash build-app.sh`。
 
-### 方式二 · 纯后台 launchd 脚本
+### 纯后台 launchd 脚本（无界面）
 
 ```bash
 bash status.sh      # 只读：打印当前用量与重置时间，不发任何消息
@@ -89,7 +113,7 @@ bash install.sh     # 启用 24/7 后台保活
 bash uninstall.sh   # 停用
 ```
 
-> 两种方式**二选一**，别同时开——否则两个调度器会往同一个账号里开火。
+> App 和后台脚本**二选一**，别同时开——否则两个调度器会往同一个账号里开火。
 
 ## 🖱️ 使用
 
@@ -108,7 +132,7 @@ bash uninstall.sh   # 停用
 | **设置** | 在首页原有内容下方就地展开：控件显隐、排序、菜单栏进度条配色 |
 | **刷新 / 退出** | |
 
-> 开机自启的登录项绑定 App 当前所在路径，所以**建议先 `bash install-app.sh` 把 App 放到 `/Applications`，再勾开机自启**，位置才稳定。勾选后会跳转「系统设置 ▸ 通用 ▸ 登录项」让你确认（普通 App 登录项是秒开、无需密码的）。
+> 开机自启的登录项绑定 App 当前所在路径，所以**建议先把 App 放到 `/Applications`（DMG 拖入或 `bash install-app.sh`），再勾开机自启**，位置才稳定。勾选后会跳转「系统设置 ▸ 通用 ▸ 登录项」让你确认（普通 App 登录项是秒开、无需密码的）。
 
 ### 交叉保活，具体来说
 
@@ -192,7 +216,7 @@ CLI 路径（手动切回时）仍在独立的系统临时空目录中运行，�
 ## 📋 环境要求
 
 - macOS 13 (Ventura) 或更高，Apple Silicon
-- Xcode Command Line Tools（`xcode-select --install`）
+- Xcode Command Line Tools（`xcode-select --install`），仅源码安装（方式 B / C）需要；DMG 安装不需要
 - Claude Code 和 / 或 Codex CLI，且**已用订阅账号登录**（读取的就是钥匙串里的这份 OAuth 凭据）
 
 ## ⚠️ 重要前提与风险（务必了解）
@@ -220,7 +244,8 @@ KA_VERIFY_ONLY=1 bash build-app.sh
 | `Sources/KeepAliveBar/` | 菜单栏 App，按状态、策略、平台实现、展示和界面分目录 |
 | `scripts/swift-sources.sh` | 构建与测试共用的 Swift 源文件清单 |
 | `build-app.sh` | 编译 → 临时目录组包 → 整包替换 `/Applications/KeepAliveBar.app` 并重启 |
-| `install-app.sh` | `build-app.sh` + 保活专用 `keepalive-claude` 固定副本 + 开机自启登录项（自动去重） |
+| `install-app.sh` | `build-app.sh` + 保活专用 `keepalive-claude` 固定副本 + 开机自启登录项（自动去重）；也支持 curl 管道一行安装 |
+| `package.sh` | 打发布用 DMG：`bash package.sh <版本>` → `KeepAliveBar-v<版本>.dmg` |
 | `keepalive.sh` | launchd 版核心：查 Claude usage / Codex 快照 → 判断 → 必要时发保活 |
 | `status.sh` | **只读**面板：打印 Claude/Codex 用量、重置时间和自动激活状态，随时可跑，不发消息 |
 | `com.iu.claude-keepalive.plist` | launchd LaunchAgent 模板 |
