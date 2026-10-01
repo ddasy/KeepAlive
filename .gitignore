@@ -12,3 +12,7 @@ codex-state.json
 
 # 打包产物（package.sh）
 *.dmg
+
+# 本地 Agent 说明（仅本地使用，不入库）
+AGENTS.md
+CLAUDE.md
