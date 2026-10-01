@@ -102,6 +102,13 @@ extension Store {
                 // 保活刚开出的新窗口可能 utilization=0%，但 resets_at 已在未来；这仍是有效窗口。
                 let hasActiveWindow = fiveReset.map { $0.timeIntervalSince(now) > 0 } ?? false
                 if hasActiveWindow { windowEnd = fiveReset }
+                // 失败文案只在下次开火成功时才会被覆盖；但窗口已开就不会再开火（例如重新登录后用户手动用了 claude），
+                // 旧的“无可用 token”会一直挂着。服务端已确认有活动窗口 → 保活目标已达成，清掉陈旧失败。
+                if hasActiveWindow, lastFireFailed, !busyFiring {
+                    lastFireFailed = false
+                    lastFireResult = "Claude 窗口已激活：\(fmt(windowEnd)) 重置"
+                    log("FIRE 失败状态已清除：服务端已有活动窗口 → \(fmt(windowEnd))")
+                }
                 // 关键诊断日志：原始 resets_at / 用量 / is_active 全记下——下次窗口过期时这行会揭示接口的真实返回
                 log("REFRESH ok five=\(pctStr(fivePct)) rawReset=\(fmt(fiveReset)) tokenExp=\(tokExp) sessionActive=\(boolStr(sessionActive)) → windowEnd=\(fmt(windowEnd)) (active=\(hasActiveWindow))")
                 if crossActive { maybeActCodex() }
