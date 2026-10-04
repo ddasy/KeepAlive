@@ -84,6 +84,7 @@ extension Store {
     func tick() {
         now = Date()   // 登录到期提醒在暂停时也继续计时
         refreshLoginExpiryIfNeeded()
+        expireTemporaryOrderIfNeeded()   // 排序属于展示，暂停时同样按到期恢复自动排序
         guard !paused else { return }   // 暂停：不联网、不续窗
         // 交叉模式需周期性读两边真值，识别用户在等待期间自行开启的新窗口。
         if crossActive, !crossRefreshing,

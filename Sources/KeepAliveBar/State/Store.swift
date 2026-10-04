@@ -123,7 +123,21 @@ final class Store: ObservableObject {
         didSet { preferences.set(codexFirst, forKey: "codexFirst") }
     }
     @Published var automaticSorting: Bool {
-        didSet { preferences.set(automaticSorting, forKey: "automaticSorting") }
+        didSet {
+            preferences.set(automaticSorting, forKey: "automaticSorting")
+            clearTemporaryOrder()   // 切换排序方式时丢弃临时顺序
+        }
+    }
+    // 自动排序下在弹窗点标题临时调整的顺序（不改 codexFirst）；到 temporaryOrderUntil 即恢复自动排序。
+    // temporaryOrderUntil 为 nil：设置时没有未来窗口，由 expireTemporaryOrderIfNeeded 等首个新窗口出现再定。
+    @Published var temporaryCodexFirst: Bool? {
+        didSet { storeOptional(temporaryCodexFirst, forKey: "temporaryCodexFirst") }
+    }
+    @Published var temporaryOrderUntil: Date? {
+        didSet { storeOptional(temporaryOrderUntil?.timeIntervalSince1970, forKey: "temporaryOrderUntil") }
+    }
+    private func storeOptional(_ value: Any?, forKey key: String) {
+        if let value { preferences.set(value, forKey: key) } else { preferences.removeObject(forKey: key) }
     }
     let bufferSec: TimeInterval = 90        // 真实重置时刻之后再等这么久才发（确保旧窗口确已关闭）
     let retryIntervalSec: TimeInterval = 180 // 两次“尝试”最小间隔：失败/未续窗时按此退避重试（3 分钟）
@@ -193,6 +207,10 @@ final class Store: ObservableObject {
         self.monitoringEnabled = monitoring
         self.codexFirst = preferences.bool(forKey: "codexFirst")
         self.automaticSorting = preferences.bool(forKey: "automaticSorting")
+        self.temporaryCodexFirst = preferences.object(forKey: "temporaryCodexFirst") as? Bool
+        if let t = preferences.object(forKey: "temporaryOrderUntil") as? Double {
+            self.temporaryOrderUntil = Date(timeIntervalSince1970: t)
+        }
         // 迁移：旧版只有一个 autoEnabled，拆分后它作为两路开关的默认值（都没写过新键时）
         let legacyAuto = (preferences.object(forKey: "autoEnabled") as? Bool) ?? true
         self.claudeAutoEnabled = (preferences.object(forKey: "claudeAutoEnabled") as? Bool) ?? legacyAuto

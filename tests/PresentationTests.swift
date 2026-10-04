@@ -108,3 +108,76 @@ extension TestSuite {
         }
     }
 }
+
+extension TestSuite {
+    func testTemporaryOrder() {
+        let soon = base.addingTimeInterval(3600)
+        let later = base.addingTimeInterval(7200)
+        check(AutomaticOrder.temporaryDeadline(now: base, claudeEnd: later, codexEnd: soon) == soon,
+              "temporary order ends at the earliest upcoming window")
+        check(AutomaticOrder.temporaryDeadline(now: base, claudeEnd: base, codexEnd: later) == later,
+              "an already expired window is not the next expiry")
+        check(AutomaticOrder.temporaryDeadline(now: base, claudeEnd: nil, codexEnd: base.addingTimeInterval(-1)) == nil,
+              "no upcoming window leaves the deadline undecided")
+
+        let s = Store(preferences: defaults, monitoring: false)
+        s.now = base
+        s.fiveReset = later
+        s.fivePct = 10
+        s.codexPrimaryReset = soon
+        s.codexPrimaryUsed = 30
+        s.swapDisplayedOrder()
+        check(s.codexFirst && s.temporaryCodexFirst == nil, "manual mode swap still changes the saved order")
+        s.codexFirst = false
+
+        s.automaticSorting = true
+        check(s.displayedCodexFirst, "automatic order puts the earlier Codex window first")
+        s.swapDisplayedOrder()
+        check(!s.displayedCodexFirst && !s.codexFirst, "automatic mode swap overrides display without changing manual order")
+        check(s.temporaryOrderUntil == soon, "override lasts until the next window expiry")
+        let restored = Store(preferences: defaults, monitoring: false)
+        restored.now = base
+        check(restored.temporaryCodexFirst == false && restored.temporaryOrderUntil == soon,
+              "temporary order survives restart")
+        s.fivePct = 100
+        check(!s.displayedCodexFirst, "usage changes do not end the temporary order")
+        s.now = soon.addingTimeInterval(-1)
+        s.expireTemporaryOrderIfNeeded()
+        check(!s.displayedCodexFirst && s.temporaryCodexFirst == false, "order holds until the deadline")
+        s.now = soon
+        check(s.displayedCodexFirst, "automatic order resumes at the deadline")
+        s.expireTemporaryOrderIfNeeded()
+        check(s.temporaryCodexFirst == nil && s.temporaryOrderUntil == nil, "expired temporary order is cleared")
+
+        s.now = base
+        s.fivePct = 10
+        s.swapDisplayedOrder()
+        check(!s.displayedCodexFirst && s.temporaryCodexFirst == false, "override again")
+        s.swapDisplayedOrder()
+        check(s.displayedCodexFirst && s.temporaryCodexFirst == nil, "moving back to the automatic order cancels the override")
+        s.swapDisplayedOrder()
+        s.automaticSorting = false
+        check(s.temporaryCodexFirst == nil && s.temporaryOrderUntil == nil, "turning automatic sorting off drops the override")
+        s.automaticSorting = true
+
+        s.fiveReset = nil
+        s.windowEnd = nil
+        s.codexPrimaryReset = nil
+        s.fivePct = nil
+        s.codexPrimaryUsed = nil
+        s.codexFirst = true
+        check(s.displayedCodexFirst, "without data automatic order keeps the saved order")
+        s.swapDisplayedOrder()
+        check(!s.displayedCodexFirst && s.temporaryOrderUntil == nil, "override without any window waits for one")
+        s.now = base.addingTimeInterval(86400)
+        s.expireTemporaryOrderIfNeeded()
+        check(!s.displayedCodexFirst && s.temporaryCodexFirst == false, "undecided override stays without windows")
+        let opened = s.now.addingTimeInterval(5 * 3600)
+        s.windowEnd = opened
+        s.expireTemporaryOrderIfNeeded()
+        check(s.temporaryOrderUntil == opened, "first new window becomes the deadline")
+        s.now = opened
+        s.expireTemporaryOrderIfNeeded()
+        check(s.displayedCodexFirst && s.temporaryCodexFirst == nil, "first new window expiry restores automatic order")
+    }
+}

@@ -3,10 +3,46 @@ import Foundation
 extension Store {
     var displayedCodexFirst: Bool {
         guard automaticSorting else { return codexFirst }
-        return AutomaticOrder.codexFirst(current: codexFirst, now: now,
-            claudeEnd: fiveReset ?? windowEnd, claudeUsed: fivePct,
-            codexEnd: codexWindowClosed ? nil : codexPrimaryReset,
-            codexUsed: codexWindowClosed ? 0 : codexPrimaryUsed)
+        if let temporary = temporaryCodexFirst, temporaryOrderUntil.map({ now < $0 }) ?? true {
+            return temporary
+        }
+        return automaticCodexFirst
+    }
+
+    private var orderClaudeEnd: Date? { fiveReset ?? windowEnd }
+    private var orderCodexEnd: Date? { codexWindowClosed ? nil : codexPrimaryReset }
+
+    private var automaticCodexFirst: Bool {
+        AutomaticOrder.codexFirst(current: codexFirst, now: now,
+            claudeEnd: orderClaudeEnd, claudeUsed: fivePct,
+            codexEnd: orderCodexEnd, codexUsed: codexWindowClosed ? 0 : codexPrimaryUsed)
+    }
+
+    // 弹窗上下移动：手动排序直接改 codexFirst；自动排序下只临时覆盖，任一 AI 的 5h 窗口到期后恢复。
+    // 移回与自动排序一致的顺序视为取消临时顺序。
+    func swapDisplayedOrder() {
+        let target = !displayedCodexFirst
+        guard automaticSorting else { codexFirst = target; return }
+        guard target != automaticCodexFirst else { clearTemporaryOrder(); return }
+        temporaryCodexFirst = target
+        temporaryOrderUntil = AutomaticOrder.temporaryDeadline(
+            now: now, claudeEnd: orderClaudeEnd, codexEnd: orderCodexEnd)
+    }
+
+    // 由 tick 调用：到期即清除；设置时没有未来窗口的，采用之后首个出现的窗口到期时刻。
+    func expireTemporaryOrderIfNeeded() {
+        guard temporaryCodexFirst != nil else { return }
+        if let until = temporaryOrderUntil {
+            if now >= until { clearTemporaryOrder() }
+        } else {
+            temporaryOrderUntil = AutomaticOrder.temporaryDeadline(
+                now: now, claudeEnd: orderClaudeEnd, codexEnd: orderCodexEnd)
+        }
+    }
+
+    func clearTemporaryOrder() {
+        if temporaryCodexFirst != nil { temporaryCodexFirst = nil }
+        if temporaryOrderUntil != nil { temporaryOrderUntil = nil }
     }
 
     // 菜单栏标题与图标共用 displayedCodexFirst，始终显示置顶 AI 的 5h 窗口。

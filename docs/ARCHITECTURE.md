@@ -29,6 +29,7 @@
 - 测试使用每次运行独有的 UserDefaults suite，并传入 `monitoring: false`。该参数只禁止初始化时启动任务，不会使显式调用网络/保活方法自动变成模拟操作。
 - 所有新增设置读写都走 `preferences`，不要在扩展里重新使用 `UserDefaults.standard`。
 - 排列、图标、倒计时共同依据 `displayedCodexFirst`；自动排序只读取已知数据，不触发查询。
+- 自动排序下弹窗手动调整只写 `temporaryCodexFirst`（不改 `codexFirst`），到 `temporaryOrderUntil`（设置时最早的未来 5h 到期）即由 tick 清除、恢复自动排序。
 - `windowEnd` 和 `codexCrossWindowEnd` 是保留的窗口锚点。nil 快照不能随意抹掉它们；Codex 空闲时滚动的 reset 也不能当成新窗口。
 - 交叉等待和执行锁继续统一管理。不要因为移动方法而改变 guard 的先后顺序、await 前后的锁范围、重试节奏或 API/CLI 回退策略。
 - 日志不得写入 access token、refresh token 或完整凭据输出。

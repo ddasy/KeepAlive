@@ -35,7 +35,7 @@ struct UsageSections: View {
     }
 
     private func isReordering(_ codex: Bool) -> Bool {
-        allowsReordering && !s.automaticSorting && selectedCodex == codex
+        allowsReordering && selectedCodex == codex
     }
 
     @ViewBuilder
@@ -66,7 +66,7 @@ struct UsageSections: View {
         let title = codex ? "Codex" : "Claude"
         let isFirst = codex == s.displayedCodexFirst
         return HStack(spacing: 6) {
-            if allowsReordering && !s.automaticSorting {
+            if allowsReordering {
                 Button {
                     selectedCodex = selectedCodex == codex ? nil : codex
                 } label: {
@@ -74,7 +74,9 @@ struct UsageSections: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .help("点击调整 \(title) 的位置")
+                .help(s.automaticSorting
+                      ? "点击临时调整 \(title) 的位置，任一 AI 的 5 小时窗口到期后恢复自动排序"
+                      : "点击调整 \(title) 的位置")
                 .accessibilityLabel("\(title)，调整顺序")
             } else {
                 Text(title).font(.headline).fixedSize()
@@ -92,7 +94,7 @@ struct UsageSections: View {
     private func moveButton(title: String, up: Bool, enabled: Bool) -> some View {
         Button {
             withAnimation(.easeInOut(duration: 0.16)) {
-                s.codexFirst.toggle()
+                s.swapDisplayedOrder()
                 selectedCodex = nil
             }
         } label: {

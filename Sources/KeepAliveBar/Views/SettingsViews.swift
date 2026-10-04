@@ -222,7 +222,7 @@ struct FeatureControls: View {
                         if includes(.query) { SettingsToggleRow(title: "自动查询", isOn: $s.autoQueryOnOpen) }
                         if includes(.sort) {
                             SettingsToggleRow(title: "自动排序", isOn: $s.automaticSorting)
-                                .help("优先显示 5 小时内较早到期的 AI；用满后切换到仍有额度的 AI。关闭后恢复手动顺序。")
+                                .help("优先显示 5 小时内较早到期的 AI；用满后切换到仍有额度的 AI。开启时也可点标题临时调整顺序，任一 AI 的 5 小时窗口到期后恢复自动排序。关闭后恢复手动顺序。")
                         }
                         if includes(.countdown) { SettingsToggleRow(title: "隐藏倒计时", isOn: $s.hideCountdown) }
                     }

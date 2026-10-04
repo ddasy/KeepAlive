@@ -27,3 +27,11 @@ enum AutomaticOrder {
         }
     }
 }
+
+extension AutomaticOrder {
+    // 自动排序下的临时手动顺序在“下一次任一 AI 的 5h 窗口到期”时失效：
+    // 取设置时仍在未来的最早到期时刻；都未知或已过期时返回 nil，等首个新窗口出现再定。
+    static func temporaryDeadline(now: Date, claudeEnd: Date?, codexEnd: Date?) -> Date? {
+        [claudeEnd, codexEnd].compactMap { $0 }.filter { $0 > now }.min()
+    }
+}

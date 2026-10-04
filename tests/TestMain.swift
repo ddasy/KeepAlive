@@ -23,6 +23,8 @@ final class TestSuite {
         testCenteredCrossKeepalivePolicy()
         testPresentation()
         reset()
+        testTemporaryOrder()
+        reset()
         testStoreScheduling()
         print("PASS: \(checks) checks (production sources; isolated settings; no network or inference requests)")
     }
