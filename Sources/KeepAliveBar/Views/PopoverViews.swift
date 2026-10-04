@@ -19,7 +19,7 @@ struct ContentView: View {
         .fixedSize(horizontal: false, vertical: true)
         .onAppear {
             s.popupOpen = true
-            if s.autoQueryOnOpen { s.refreshNow() }   // 打开弹窗时按开关决定是否自动查询用量
+            if s.autoQueryOnOpen { s.refreshOnPopoverOpen() }   // 打开弹窗时按开关自动查询（429/60 秒内会跳过）
         }
         .onDisappear {
             s.popupOpen = false

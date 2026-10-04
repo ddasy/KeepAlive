@@ -25,6 +25,18 @@ extension Store {
     // 手动刷新：清零退避指数，否则退到 30 分钟后用户点“刷新”还得按老节奏等——手动动作应当立刻生效。
     func refreshNow() { refreshRetryFailures = 0; Task { await refresh() } }
 
+    // 打开弹窗时的自动查询。和手动「刷新」不同：被 429 限流时一次都不发，也不清零退避——
+    // 过去每开一次弹窗就清零退避并立刻再撞一次，几分钟里撞了十几次 429，越撞越久。
+    // 限流期间交给 scheduleRefreshRetry 的定时器按退避自动重试；平时距上次查询不足 60 秒也跳过。
+    func refreshOnPopoverOpen() {
+        if usageRateLimited {
+            log("AUTO-QUERY skip: usage 429 限流中，等定时重试")
+            return
+        }
+        if let last = lastUsageQuery, Date().timeIntervalSince(last) < 60 { return }
+        Task { await refresh() }
+    }
+
     // 暂停 / 恢复：暂停后停止 GET 与续窗；恢复后立即刷新一次
     func togglePause() {
         paused.toggle()

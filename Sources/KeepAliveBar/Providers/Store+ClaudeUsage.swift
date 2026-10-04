@@ -67,6 +67,7 @@ extension Store {
             req.setValue("claude-code/2.1", forHTTPHeaderField: "User-Agent")
             req.timeoutInterval = 20
             do {
+                lastUsageQuery = Date()
                 let (data, resp) = try await URLSession.shared.data(for: req)
                 if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
                     // 关键诊断：状态码 + token 过期状态 + 服务端错误体（含 authentication_error 等具体类型）。
@@ -82,11 +83,13 @@ extension Store {
                             continue
                         }
                     }
+                    usageRateLimited = http.statusCode == 429
                     lastError = "Claude：usage HTTP \(http.statusCode)"
                     log("REFRESH http \(http.statusCode) tokenExp=\(tokExp) body=\(String(body.prefix(220)))")
                     scheduleRefreshRetry("usage HTTP \(http.statusCode)")
                     return
                 }
+                usageRateLimited = false
                 refreshRetryFailures = 0   // 拿到 200 → 退避指数清零，下次失败重新从 3 分钟起算
                 let u = try JSONDecoder().decode(UsageResponse.self, from: data)
                 fivePct = u.five_hour?.utilization;         fiveReset = parseISO(u.five_hour?.resets_at)

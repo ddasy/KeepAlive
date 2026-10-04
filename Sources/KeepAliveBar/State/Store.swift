@@ -147,6 +147,8 @@ final class Store: ObservableObject {
     var codexActing = false
     var refreshRetryTask: Task<Void, Never>?
     var refreshRetryFailures = 0     // 连续失败次数 → scheduleRefreshRetry 的指数退避指数（成功即清零）
+    var usageRateLimited = false     // 上一次 usage GET 是 429 → 打开弹窗不再自动查询，交给退避定时器（拿到 200 清掉）
+    var lastUsageQuery: Date?        // 上一次真正发出 usage GET 的时刻 → 打开弹窗的自动查询按此节流
     var busyRefreshingToken = false  // token 刷新单飞：只防自己并发，不防 CLI（见 refreshOAuthToken 注释）
     let keychainService = "Claude Code-credentials"
     let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
