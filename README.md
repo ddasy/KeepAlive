@@ -239,7 +239,7 @@ Module layout, state constraints, and where new features belong: [docs/ARCHITECT
 | `scripts/swift-sources.sh` | The Swift source list shared by the build and the tests |
 | `build-app.sh` | Compile → assemble in a temp dir → atomically replace `/Applications/KeepAliveBar.app` and restart |
 | `install-app.sh` | `build-app.sh` + pinned `keepalive-claude` copy + login item; also works as a `curl` one-liner |
-| `package.sh` | Build the release DMG: `bash package.sh <version>` → `KeepAliveBar-v<version>.dmg` |
+| `package.sh` | Build the release DMG, auto-bump the version and create a local tag: `bash package.sh` (+0.0.1) / `minor` (+0.1) / `major` (+1) / `<x.y.z>` / `--current` (no bump) → `KeepAliveBar-v<version>.dmg` |
 | `keepalive.sh` | The launchd core: read usage → decide → fire if needed |
 | `status.sh` | **Read-only** panel: usage, reset times, activation state. Safe to run anytime |
 | `com.iu.claude-keepalive.plist` | LaunchAgent template |

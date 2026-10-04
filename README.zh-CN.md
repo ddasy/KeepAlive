@@ -245,7 +245,7 @@ KA_VERIFY_ONLY=1 bash build-app.sh
 | `scripts/swift-sources.sh` | 构建与测试共用的 Swift 源文件清单 |
 | `build-app.sh` | 编译 → 临时目录组包 → 整包替换 `/Applications/KeepAliveBar.app` 并重启 |
 | `install-app.sh` | `build-app.sh` + 保活专用 `keepalive-claude` 固定副本 + 开机自启登录项（自动去重）；也支持 curl 管道一行安装 |
-| `package.sh` | 打发布用 DMG：`bash package.sh <版本>` → `KeepAliveBar-v<版本>.dmg` |
+| `package.sh` | 打发布用 DMG 并自动递增版本、建本地 tag：`bash package.sh`（+0.0.1）/ `minor`（+0.1）/ `major`（+1）/ `<x.y.z>` / `--current`（不递增）→ `KeepAliveBar-v<版本>.dmg` |
 | `keepalive.sh` | launchd 版核心：查 Claude usage / Codex 快照 → 判断 → 必要时发保活 |
 | `status.sh` | **只读**面板：打印 Claude/Codex 用量、重置时间和自动激活状态，随时可跑，不发消息 |
 | `com.iu.claude-keepalive.plist` | launchd LaunchAgent 模板 |
