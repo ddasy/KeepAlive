@@ -36,27 +36,18 @@ extension Store {
             scheduleRefreshRetry("代理未开启")
             return
         }
-        var cred = await readCredential()
-        // token 过期就先换一张再发请求：过期后直接发 GET 必得 401，而空闲的 claude 会话不会替我们刷新，
-        // 于是过去会一路 401 刷到某个 CLI 恰好起来为止（最长一次刷了 4 小时）。换 token 不耗用量、不开窗。
-        if tokenNeedsRefresh(cred.expiresAtMs), await refreshOAuthToken(cred) {
-            cred = await readCredential()
-        }
-        // 循环只为 401 后换 token 重试一次；其余每条路径都以 return 收尾，不会转第二圈。
-        var triedTokenRefresh = false
+        // 只读钥匙串里最新的 token；有 claude 进程时由它们换 token，App 不插手（见 ClaudeTokenPolicy）。
+        // 拿不到可用 token 就不发请求：无效凭据一次都不该打出去，401/429 刷屏就是这么来的。
+        let usable = await usableClaudeToken()
+        var cred = usable.cred, token = usable.token
+        let reason = usable.reason
+        // 循环只为 401 后改用新 token 重试一次；其余每条路径都以 return 收尾，不会转第二圈。
+        var retried401 = false
         while true {
-            guard let tok = cred.accessToken else {
-                lastError = "Claude：无法读取 Keychain token（\(cred.diag)）"
-                log("REFRESH abort: 无法读取 Keychain token — \(cred.diag)")
-                scheduleRefreshRetry("无法读取 Keychain token")
-                return
-            }
-            // token 仍是过期的（上面换失败，多半 refreshToken 也废了）→ 别再发这一发注定 401 的请求。
-            // 这是 401/429 刷屏的止血点：无效凭据一次都不该打出去，429 本来就是这么被限流出来的。
-            if tokenNeedsRefresh(cred.expiresAtMs) {
-                lastError = "Claude：token 已过期且刷新失败，需重新登录 claude"
-                log("REFRESH abort: token \(tokenExpStr(cred.expiresAtMs)) 且刷新失败 → 跳过 GET（需 claude auth login）")
-                scheduleRefreshRetry("token 过期且刷新失败")
+            guard let tok = token else {
+                lastError = "Claude：\(reason)"
+                log("REFRESH abort: \(reason)（token \(tokenExpStr(cred.expiresAtMs))）→ 跳过 GET")
+                scheduleRefreshRetry(reason)
                 return
             }
             let tokExp = tokenExpStr(cred.expiresAtMs)
@@ -74,12 +65,22 @@ extension Store {
                     // 401 时这行能一眼分清是「token 已过期」还是「被吊销/无效」，不再只看到红字一闪。
                     let body = (String(data: data, encoding: .utf8) ?? "")
                         .trimmingCharacters(in: .whitespacesAndNewlines)
-                    // 401 但本地看着 token 没过期 → 多半是被吊销/服务端不认。换一张再试一次（只一次，防循环）。
-                    if http.statusCode == 401, !triedTokenRefresh {
-                        triedTokenRefresh = true
-                        log("REFRESH http 401 tokenExp=\(tokExp)（本地未过期）→ 换新 token 后重试一次")
-                        if await refreshOAuthToken(cred) {
+                    // 401 但本地看着 token 没过期 → 先看钥匙串是否已换成新 token（CLI 刚刷过）；
+                    // 没换且本机没有 claude 进程时才由 App 自己换。只重试一次，防循环。
+                    if http.statusCode == 401, !retried401 {
+                        retried401 = true
+                        let latest = await readCredential()
+                        if let fresh = latest.accessToken, fresh != tok {
+                            log("REFRESH http 401 tokenExp=\(tokExp) → 钥匙串已有新 token，重试一次")
+                            (cred, token) = (latest, fresh)
+                            continue
+                        }
+                        if await claudeCLIRunning() {
+                            log("REFRESH http 401 tokenExp=\(tokExp)（本地未过期）→ 有 claude 进程，等待其刷新")
+                        } else if await refreshOAuthToken(latest) {
+                            log("REFRESH http 401 tokenExp=\(tokExp)（本地未过期）→ 已换新 token，重试一次")
                             cred = await readCredential()
+                            token = cred.accessToken
                             continue
                         }
                     }

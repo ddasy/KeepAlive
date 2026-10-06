@@ -33,6 +33,7 @@
 - `windowEnd` 和 `codexCrossWindowEnd` 是保留的窗口锚点。nil 快照不能随意抹掉它们；Codex 空闲时滚动的 reset 也不能当成新窗口。
 - 交叉等待和执行锁继续统一管理。不要因为移动方法而改变 guard 的先后顺序、await 前后的锁范围、重试节奏或 API/CLI 回退策略。
 - 日志不得写入 access token、refresh token 或完整凭据输出。
+- Claude token 只在本机没有任何 claude 进程时由 App 刷新；有进程（含闲置会话）时 App 只读钥匙串，过期就等 CLI 刷新、不发请求。refresh token 每用一次就轮换，两边同时刷新会导致全体掉线。规则在 `Domain/ClaudeTokenPolicy.swift`。
 
 ## 新增功能放哪里
 

@@ -20,15 +20,14 @@ extension Store {
     // 真的落到了未来（= 新窗口已开），没开出来照样算失败。
     // 要手动退回旧写法：UserDefaults 的 directFire 设为 false（显式开关，不是自动降级）。
     func fireDirect() async -> Bool {
-        var cred = await readCredential()
-        // 与 refresh() 同样的策略：token 快过期先换一张，别发一发注定 401 的请求。
-        if tokenNeedsRefresh(cred.expiresAtMs), await refreshOAuthToken(cred) {
-            cred = await readCredential()
-        }
-        guard let tok = cred.accessToken, !tokenNeedsRefresh(cred.expiresAtMs) else {
+        // 与 refresh() 同样的策略：只用钥匙串里最新的可用 token，有 claude 进程时等它换，别发一发注定 401 的请求。
+        let usable = await usableClaudeToken()
+        let cred = usable.cred
+        guard let tok = usable.token else {
+            let mins = Int(retryIntervalSec / 60)
             lastFireFailed = true
-            lastFireResult = "Claude 保活失败：无可用 token（\(cred.diag)），需重新登录 claude"
-            log("FIRE direct 失败：无可用 token（\(cred.diag)）—— 窗口未续")
+            lastFireResult = "Claude 保活暂缓：\(usable.reason)，约 \(mins) 分钟后重试"
+            log("FIRE direct 暂缓：\(usable.reason) —— 窗口未续")
             return false
         }
         var req = URLRequest(url: claudeAPIURL)

@@ -22,6 +22,7 @@ final class TestSuite {
         testCrossKeepalivePolicy()
         testCenteredCrossKeepalivePolicy()
         testPresentation()
+        testClaudeTokenPolicy()
         reset()
         testTemporaryOrder()
         reset()

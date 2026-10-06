@@ -143,7 +143,6 @@ final class Store: ObservableObject {
     let retryIntervalSec: TimeInterval = 180 // 两次“尝试”最小间隔：失败/未续窗时按此退避重试（3 分钟）
     let refreshRetryIntervalSec: TimeInterval = 180 // 用量查询失败/缺少窗口时间时的退避基数（3 分钟起，指数增长）
     let refreshRetryMaxIntervalSec: TimeInterval = 1800 // 退避上限 30 分钟
-    let tokenRefreshBufferSec: TimeInterval = 300 // token 剩余寿命少于 5 分钟就提前换，别卡在边界上发请求
     let codexBufferSec: TimeInterval = 90
     let codexRetryIntervalSec: TimeInterval = 180
     let codexFallbackSec: TimeInterval = 18000 // 没有 reset 快照时，连续 5 小时后首次激活
@@ -163,7 +162,7 @@ final class Store: ObservableObject {
     var refreshRetryFailures = 0     // 连续失败次数 → scheduleRefreshRetry 的指数退避指数（成功即清零）
     var usageRateLimited = false     // 上一次 usage GET 是 429 → 打开弹窗不再自动查询，交给退避定时器（拿到 200 清掉）
     var lastUsageQuery: Date?        // 上一次真正发出 usage GET 的时刻 → 打开弹窗的自动查询按此节流
-    var busyRefreshingToken = false  // token 刷新单飞：只防自己并发，不防 CLI（见 refreshOAuthToken 注释）
+    var busyRefreshingToken = false  // token 刷新单飞：只防自己并发；与 CLI 的竞态靠“有 claude 进程就不换”规避（见 ClaudeTokenPolicy）
     let keychainService = "Claude Code-credentials"
     let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
 
