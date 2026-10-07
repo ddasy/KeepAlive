@@ -10,7 +10,7 @@ extension Store {
         if directFireEnabled { _ = await fireDirect() } else { await fireCLI() }
     }
 
-    // 直连一条最小推理请求开窗（实测 8 in / 1 out，claude -p 是 22,698 / 51）。
+    // 直连一条最小推理请求开窗（Haiku 5.5 low 实测 33 in / 1 out，claude -p 是 ~24,000 / 4）。
     // 用的就是钥匙串里那张订阅 OAuth token（与查 usage 同一张），因此和 claude -p 一样
     // 计入订阅的 5h/周限额 —— 省掉的只是工具定义、系统提示词和全局 CLAUDE.md。
     //
@@ -41,9 +41,11 @@ extension Store {
         req.timeoutInterval = 30
         req.httpBody = try? JSONSerialization.data(withJSONObject: [
             "model": claudeAPIModel, "max_tokens": 1,
+            "output_config": ["effort": claudeEffort],
+            "system": [["type": "text", "text": claudeIdentityPrompt]],
             "messages": [["role": "user", "content": "."]]
         ])
-        log("FIRE start: 直连 POST /v1/messages (\(claudeAPIModel), max_tokens=1)")
+        log("FIRE start: 直连 POST /v1/messages (\(claudeAPIModel), effort=\(claudeEffort), max_tokens=1)")
         do {
             let (data, resp) = try await URLSession.shared.data(for: req)
             let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
@@ -85,13 +87,13 @@ extension Store {
         lastFire = stamp
         preferences.set(stamp.timeIntervalSince1970, forKey: "lastFire")
         lastFireFailed = false
-        lastFireResult = "Claude 保活成功（直连，~8 tokens）：新窗口 \(fmt(end)) 重置"
+        lastFireResult = "Claude 保活成功（直连，~34 tokens）：新窗口 \(fmt(end)) 重置"
         log("FIRED direct -> 新窗口 windowEnd=\(fmt(end))")
         return true
     }
 
     func fireCLI() async {
-        log("FIRE start: claude -p 'Reply OK' --model haiku（脱钩：子进程自负钥匙串责任，避免弹授权框）")
+        log("FIRE start: claude -p 'Reply OK' --model \(claudeAPIModel) --effort \(claudeEffort)（脱钩：子进程自负钥匙串责任，避免弹授权框）")
         let temporaryDirectory: URL
         do {
             temporaryDirectory = try makeTemporaryKeepaliveDirectory()
@@ -103,11 +105,11 @@ extension Store {
         }
         defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
         let env = baseEnv(); let wd = temporaryDirectory.path; let bin = keepaliveClaudeBin
-        // 空目录 + 禁 MCP + 去除 API key（走订阅）+ Haiku
+        // 空目录 + 禁 MCP + 去除 API key（走订阅）+ Haiku 5.5 low
         // 用固定路径副本（keepaliveClaudeBin）而非 PATH 里天天更新的 claude，
         // 让钥匙串授权对象身份稳定，避免每次到期都弹版本号授权框。
         let cmd = "cd '\(wd)' && exec env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN " +
-                  "'\(bin)' -p 'Reply OK' --model haiku --strict-mcp-config"
+                  "'\(bin)' -p 'Reply OK' --model \(claudeAPIModel) --effort \(claudeEffort) --strict-mcp-config"
         // 用 runDisclaimed 而非 run：claude 刷新 OAuth token 写钥匙串时不再算到本 App（ad-hoc 签名）头上，
         // 从而不再每次弹“允许访问钥匙串”框（详见 Shell.runDisclaimed 注释）。
         let r = await Task.detached { Shell.runDisclaimed("/bin/bash", ["-c", cmd], env: env) }.value

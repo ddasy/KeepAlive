@@ -36,7 +36,8 @@ if [ -z "$CLAUDE_BIN" ]; then
 fi
 KEYCHAIN_SERVICE="${KA_KEYCHAIN_SERVICE:-Claude Code-credentials}"
 USAGE_URL="https://api.anthropic.com/api/oauth/usage"
-MODEL="${KA_MODEL:-haiku}"          # 用最便宜的模型保活，尽量少占周限额
+MODEL="${KA_MODEL:-claude-haiku-5-5}"   # 用最便宜的模型保活，尽量少占周限额
+CLAUDE_EFFORT="${KA_CLAUDE_EFFORT:-low}"
 PROMPT="${KA_PROMPT:-Reply OK}"     # 保活消息内容（越短越好）
 BUFFER_SEC="${KA_BUFFER_SEC:-90}"   # 在真实重置时刻之后再等这么久才发（确保旧窗口彻底关闭）
 MIN_REFIRE_SEC="${KA_MIN_REFIRE_SEC:-17400}"  # 防抖：两次保活至少间隔 4h50m
@@ -72,7 +73,9 @@ WEEKLY_GUARD_PCT="${KA_WEEKLY_GUARD_PCT:-101}"
 CLAUDE_DIRECT="${KA_CLAUDE_DIRECT:-1}"
 CODEX_DIRECT="${KA_CODEX_DIRECT:-1}"
 CLAUDE_API_URL="https://api.anthropic.com/v1/messages"
-CLAUDE_API_MODEL="${KA_API_MODEL:-claude-haiku-4-5-20251001}"  # CLI 收别名(haiku)，HTTP 要完整 id
+CLAUDE_API_MODEL="${KA_API_MODEL:-claude-haiku-5-5}"
+# 订阅 OAuth 直连 Haiku 5.5 必须带 Claude Code 身份系统提示，否则服务端回 429（并非真限流）。
+# 实测同一请求：Haiku 4.5 22 in / 1 out，Haiku 5.5 33 in / 1 out。
 CODEX_RESPONSES_URL="https://chatgpt.com/backend-api/codex/responses"
 CODEX_USAGE_URL="https://chatgpt.com/backend-api/wham/usage"   # Codex 版的 /api/oauth/usage，免费、服务端真值
 
@@ -149,10 +152,10 @@ fire_keepalive_cli() {
   local out
   out="$(trap '/bin/rm -rf -- "$workdir"' EXIT
         cd "$workdir" && env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
-        "$CLAUDE_BIN" -p "$PROMPT" --model "$MODEL" --strict-mcp-config 2>&1)"
+        "$CLAUDE_BIN" -p "$PROMPT" --model "$MODEL" --effort "$CLAUDE_EFFORT" --strict-mcp-config 2>&1)"
   local rc=$?
   if [ $rc -eq 0 ]; then
-    log "🔔 FIRED keep-alive (CLI, model=$MODEL) -> 已开启新的 5 小时窗口。回复: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-60)"
+    log "🔔 FIRED keep-alive (CLI, model=$MODEL effort=$CLAUDE_EFFORT) -> 已开启新的 5 小时窗口。回复: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-60)"
   else
     log "❌ keep-alive 失败 rc=$rc: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)"
   fi
@@ -170,7 +173,7 @@ claude_fire_direct() {  # $1=token → 输出 HTTP 状态码
     -H "content-type: application/json" \
     -H "x-app: cli" \
     -H "User-Agent: claude-cli/2.1 (external, cli)" \
-    --data-binary "{\"model\":\"$CLAUDE_API_MODEL\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\".\"}]}" \
+    --data-binary "{\"model\":\"$CLAUDE_API_MODEL\",\"max_tokens\":1,\"output_config\":{\"effort\":\"$CLAUDE_EFFORT\"},\"system\":[{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\"}],\"messages\":[{\"role\":\"user\",\"content\":\".\"}]}" \
     2>/dev/null
 }
 
@@ -219,7 +222,7 @@ fire_keepalive() {
     reset="$(claude_window_reset "$tok")"
     now2=$(date +%s)
     if [ -n "$reset" ] && [ "$reset" -gt "$now2" ] 2>/dev/null; then
-      log "🔔 FIRED keep-alive (直连 /v1/messages, ~8 tokens) -> 新窗口 reset=$(date -r "$reset" '+%Y-%m-%d %H:%M:%S')"
+      log "🔔 FIRED keep-alive (直连 /v1/messages, ~34 tokens) -> 新窗口 reset=$(date -r "$reset" '+%Y-%m-%d %H:%M:%S')"
       return 0
     fi
   done
