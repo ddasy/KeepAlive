@@ -179,12 +179,7 @@ final class Store: ObservableObject {
     // 好让问题第一时间暴露，而不是被 CLI 补发掩盖成"一切正常"。
     // 想整体退回 CLI 写法：UserDefaults 里把 directFire 设为 false（无 UI 开关，调试用）。
     let claudeAPIURL = URL(string: "https://api.anthropic.com/v1/messages")!
-    // 2026-10-08 起改用 Haiku 5.5 + effort low。订阅 OAuth 直连 Haiku 5.5 必须带 Claude Code 身份
-    // 系统提示，否则服务端回 429 rate_limit_error（同账号 Haiku 4.5 不受影响）——别把它当成真限流。
-    // 实测同一请求：Haiku 4.5 22 in / 1 out，Haiku 5.5 33 in / 1 out（新 tokenizer 计数更多）。
-    let claudeAPIModel = "claude-haiku-5-5"
-    let claudeEffort = "low"
-    let claudeIdentityPrompt = "You are Claude Code, Anthropic's official CLI for Claude."
+    let claudeAPIModel = "claude-haiku-4-5-20251001"   // CLI 收别名(haiku)，HTTP 要完整 id
     let codexResponsesURL = URL(string: "https://chatgpt.com/backend-api/codex/responses")!
     let codexUsageURL = URL(string: "https://chatgpt.com/backend-api/wham/usage")!
     var directFireEnabled: Bool {

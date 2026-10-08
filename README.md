@@ -173,7 +173,7 @@ anthropic-beta: oauth-2025-04-20
 
 | | Old (CLI) | Now (direct HTTP) |
 |---|---|---|
-| Claude | `claude -p 'Reply OK' --model haiku` → **22,698** in / 51 out | `POST /v1/messages` (Haiku 5.5, effort low) → **33** in / 1 out |
+| Claude | `claude -p 'Reply OK' --model haiku` → **22,698** in / 51 out | `POST /v1/messages` → **8** in / 1 out |
 | Codex | `codex exec 'Reply OK'` → **13,871** in / 16 out | `POST /backend-api/codex/responses` → **14** in / 16 out |
 
 *(Measured 2026-09-06, same machine, same account.)*
@@ -184,7 +184,7 @@ anthropic-beta: oauth-2025-04-20
 
 > Side effect worth knowing: Codex's login state is maintained by its CLI. Since there's no automatic CLI fallback, an expired token means the direct call just keeps returning 401 — run `codex` once or log in again. The log says so explicitly.
 
-The CLI path (when you switch back manually) still runs inside an empty system temp directory that is deleted the moment the command finishes, so there is no file, `CLAUDE.md`, or git context to read or leave behind; Claude runs with `--model claude-haiku-5-5 --effort low --strict-mcp-config` and a cleared `ANTHROPIC_API_KEY`.
+The CLI path (when you switch back manually) still runs inside an empty system temp directory that is deleted the moment the command finishes, so there is no file, `CLAUDE.md`, or git context to read or leave behind; Claude runs with `--model haiku --strict-mcp-config` and a cleared `ANTHROPIC_API_KEY`.
 
 ## 🔧 Configuration (headless mode)
 
@@ -194,9 +194,8 @@ Environment variables, settable in the plist's `EnvironmentVariables`:
 |---|---|---|
 | `KA_CLAUDE_DIRECT` | `1` | 1 = direct `POST /v1/messages` (8 tokens); 0 = manual fallback to `claude -p` (22,698). Never falls back on its own |
 | `KA_CODEX_DIRECT` | `1` | 1 = direct `POST .../codex/responses` (30 tokens); 0 = manual fallback to `codex exec` (13,871) |
-| `KA_API_MODEL` | `claude-haiku-5-5` | Full model id for the direct call (HTTP doesn't take CLI aliases) |
-| `KA_CLAUDE_EFFORT` | `low` | Effort level for Claude keepalive (direct and CLI) |
-| `KA_MODEL` | `claude-haiku-5-5` | Model used when falling back to the CLI |
+| `KA_API_MODEL` | `claude-haiku-4-5-20251001` | Full model id for the direct call (HTTP doesn't take CLI aliases) |
+| `KA_MODEL` | `haiku` | Model used when falling back to the CLI |
 | `KA_BUFFER_SEC` | `90` | Seconds to wait past the real reset instant before firing |
 | `KA_MIN_REFIRE_SEC` | `17400` | Debounce: minimum gap between two keepalives (4h50m) |
 | `KA_WEEKLY_GUARD_PCT` | `101` | Pause keepalive at or above this weekly percentage (default never; set 90 to conserve) |

@@ -176,7 +176,7 @@ anthropic-beta: oauth-2025-04-20
 
 | | 旧写法（CLI） | 现在（直连 HTTP） |
 |---|---|---|
-| Claude | `claude -p 'Reply OK' --model haiku` → **22,698** in / 51 out | `POST /v1/messages`（Haiku 5.5，effort low）→ **33** in / 1 out |
+| Claude | `claude -p 'Reply OK' --model haiku` → **22,698** in / 51 out | `POST /v1/messages` → **8** in / 1 out |
 | Codex | `codex exec 'Reply OK'` → **13,871** in / 16 out | `POST /backend-api/codex/responses` → **14** in / 16 out |
 
 *（2026-09-06 同机同账号实测。）*
@@ -190,7 +190,7 @@ anthropic-beta: oauth-2025-04-20
 
 > ⚠️ 附带影响：Codex 的登录态由 CLI 维护。既然不再自动回落 CLI，token 过期后直连会一直 401、不会被自动刷新——跑一次 `codex` 或重新登录即可。日志里会写清楚。
 
-CLI 路径（手动切回时）仍在独立的系统临时空目录中运行，命令结束后立即删除该目录，因此没有文件、`CLAUDE.md` 或 git 上下文可被读取或遗留；Claude 用 `--model claude-haiku-5-5 --effort low`、`--strict-mcp-config`，并清除 `ANTHROPIC_API_KEY`。
+CLI 路径（手动切回时）仍在独立的系统临时空目录中运行，命令结束后立即删除该目录，因此没有文件、`CLAUDE.md` 或 git 上下文可被读取或遗留；Claude 用 `--model haiku`、`--strict-mcp-config`，并清除 `ANTHROPIC_API_KEY`。
 
 ## 🔧 配置（后台模式环境变量）
 
@@ -200,9 +200,8 @@ CLI 路径（手动切回时）仍在独立的系统临时空目录中运行，�
 |---|---|---|
 | `KA_CLAUDE_DIRECT` | `1` | 1=直连 `POST /v1/messages` 保活（8 tokens）；0=手动退回 `claude -p`（22,698 tokens）。失败时不会自动降级 |
 | `KA_CODEX_DIRECT` | `1` | 1=直连 `POST .../codex/responses`（30 tokens）；0=手动退回 `codex exec`（13,871 tokens） |
-| `KA_API_MODEL` | `claude-haiku-5-5` | 直连用的完整 model id（CLI 收别名，HTTP 不收） |
-| `KA_CLAUDE_EFFORT` | `low` | Claude 保活的 effort（直连与 CLI 通用） |
-| `KA_MODEL` | `claude-haiku-5-5` | 切回 CLI 写法时用的模型（最省周限额） |
+| `KA_API_MODEL` | `claude-haiku-4-5-20251001` | 直连用的完整 model id（CLI 收别名，HTTP 不收） |
+| `KA_MODEL` | `haiku` | 切回 CLI 写法时用的模型（最省周限额） |
 | `KA_BUFFER_SEC` | `90` | 真实重置时刻之后再等多少秒才发（确保旧窗口彻底关闭） |
 | `KA_MIN_REFIRE_SEC` | `17400` | 防抖：两次保活最小间隔（4h50m） |
 | `KA_WEEKLY_GUARD_PCT` | `101` | 周用量≥此百分比时暂停保活（默认永不触发；设 90 可省额度） |
