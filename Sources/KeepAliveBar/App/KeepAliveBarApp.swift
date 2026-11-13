@@ -18,7 +18,7 @@ struct KeepAliveBarApp: App {
         MenuBarExtra {
             ContentView().environmentObject(store)
         } label: {
-            // 图标与倒计时合成成一张图交出去：MenuBarExtra 的 label 只渲染第一个 Image，
+            // 图标、时钟与倒计时合成成一张图交出去：MenuBarExtra 的 label 只渲染第一个 Image，
             // 分成两个 Image 时倒计时会被整段丢掉（见 MenuBarCountdown 的注释）。
             if let label = store.menuBarImage {
                 Image(nsImage: label)

@@ -55,14 +55,16 @@ final class Store: ObservableObject {
     @Published var codexWindowClosed = false
     @Published var codexLastFire: Date?
     @Published var codexLastFireFailed = false
-    @Published var codexLastFireResult: String = ""
+    @Published var codexLastFireResult: String = "" { didSet { codexLastFireResultReset = nil } }
+    @Published var codexLastFireResultReset: Date?
     @Published var claudeLoginExpiresAt: Date?
     var lastLoginExpiryCheck: Date?
     var checkingLoginExpiry = false
     @Published var lastError: String?
     @Published var lastFire: Date?
     @Published var lastFireFailed = false
-    @Published var lastFireResult: String = ""
+    @Published var lastFireResult: String = "" { didSet { lastFireResultReset = nil } }
+    @Published var lastFireResultReset: Date?
     @Published var busyFiring = false
     @Published var now: Date = Date()
     // 保活开关拆成两路：Claude / Codex 各自独立，互不影响（旧版单一 autoEnabled 键在 init 里迁移）
@@ -88,7 +90,10 @@ final class Store: ObservableObject {
     @Published var autoQueryOnOpen: Bool {                        // 打开菜单栏弹窗时是否自动查询一次用量
         didSet { preferences.set(autoQueryOnOpen, forKey: "autoQueryOnOpen") }
     }
-    @Published var hideCountdown: Bool {                          // 隐藏倒计时：菜单栏只留图标
+    @Published var timeZoneSelection: String {
+        didSet { preferences.set(DisplayTimeZone.normalized(timeZoneSelection), forKey: "displayTimeZone") }
+    }
+    @Published var hideCountdown: Bool {                          // 隐藏下行倒计时，时钟仍显示
         didSet { preferences.set(hideCountdown, forKey: "hideCountdown") }
     }
     @Published var visibleMenuControls: [String] {
@@ -230,6 +235,7 @@ final class Store: ObservableObject {
             (preferences.object(forKey: "menuBarFillOpacity") as? Double) ?? 1, fallback: 1)
         self.menuBarTrackOpacity = Self.normalizedOpacity(
             (preferences.object(forKey: "menuBarTrackOpacity") as? Double) ?? 0.22, fallback: 0.22)
+        self.timeZoneSelection = DisplayTimeZone.normalized(preferences.string(forKey: "displayTimeZone"))
         self.hideCountdown = preferences.bool(forKey: "hideCountdown")   // 默认 false（显示倒计时）
         if let t = preferences.object(forKey: "windowEnd") as? Double {
             self.windowEnd = Date(timeIntervalSince1970: t)

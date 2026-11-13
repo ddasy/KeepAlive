@@ -17,6 +17,8 @@ final class TestSuite {
 
     func run() {
         defer { reset() }
+        testTimeZone()
+        reset()
         testPreferences()
         reset()
         testCrossKeepalivePolicy()

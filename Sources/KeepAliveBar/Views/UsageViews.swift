@@ -41,12 +41,12 @@ struct UsageSections: View {
     @ViewBuilder
     private func loginExpiryLabel(codex: Bool) -> some View {
         if !codex, let deadline = s.claudeLoginExpiresAt {
-            Text("登录到期 \(deadline.formatted(.dateTime.month(.twoDigits).day(.twoDigits).hour().minute()))")
+            Text("登录到期 \(s.localMDHM(deadline))")
                 .font(.caption2)
                 .foregroundStyle(deadline <= s.now ? Color.red : (s.loginExpiryWarning ? Color.orange : Color.secondary))
                 .lineLimit(1)
                 .minimumScaleFactor(0.85)
-                .help("登录到期：\(deadline.formatted(.dateTime.year().month().day().hour().minute()))")
+                .help("登录到期：\(s.formattedTime(deadline, format: "yyyy-MM-dd HH:mm"))")
         }
     }
 
@@ -119,7 +119,7 @@ struct UsageSections: View {
                     .font(.subheadline).foregroundStyle(sevColor(pct))
             }
             UsageBar(value: (pct ?? 0) / 100, color: sevColor(pct))
-            Text(weekly ? weeklyResetInfo(reset, s.now) : resetInfo(reset, s.now))
+            Text(weekly ? s.weeklyResetInfo(reset, s.now) : s.resetInfo(reset, s.now))
                 .font(.caption2).foregroundStyle(.secondary)
         }
     }
@@ -145,7 +145,7 @@ struct UsageSections: View {
             } else if rolledOff {
                 Text("已重置（快照过期，无实时数据）").font(.caption2).foregroundStyle(.secondary)
             } else if let r = reset {
-                Text(withDate ? weeklyResetInfo(r, s.now) : resetInfo(r, s.now))
+                Text(withDate ? s.weeklyResetInfo(r, s.now) : s.resetInfo(r, s.now))
                     .font(.caption2).foregroundStyle(.secondary)
             } else {
                 Text("暂无快照").font(.caption2).foregroundStyle(.secondary)

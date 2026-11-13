@@ -65,7 +65,7 @@ struct SnapshotView: View {
     var freshness: String {
         if s.paused { return "已暂停 · 快照" }
         guard let r = s.lastRefresh else { return "暂无数据 · 快照" }
-        return "数据截至 \(localHM(r)) · 快照"
+        return "数据截至 \(s.localHM(r)) · 快照"
     }
 
     var body: some View {

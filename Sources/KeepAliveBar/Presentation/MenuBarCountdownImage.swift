@@ -1,70 +1,55 @@
 import AppKit
 
-// MARK: - 菜单栏标签：图标 + 倒计时 + 底部用量条
-// 三样东西合成同一张图，因为 MenuBarExtra 的 label 只会渲染第一个 Image
-//（实测：图标 + 倒计时两个 Image 时，状态项宽度从 87 掉到 38.5，倒计时整段消失）。
-// 倒计时用菜单栏标签色正常渲染（深色菜单栏＝白字，浅色＝黑字），用量画在文字正下方的一条细线上：
-// 线宽固定为 "6m" 的文字宽度（不随倒计时文字变长变短，否则同样的百分比看起来忽长忽短），
-// 条与文字在同一列里水平居中，
-// 最左 0%、最右 100%，绿/橙/红沿用弹窗用量条的同一套阈值（见 UsageSeverity）。
-// 隐藏倒计时（标题为空）时用量条改画在图标正下方，线宽＝图标宽度。
+// 图标、双行文字和用量条合成一张图片，保持现有 MenuBarExtra 标签渲染方式。
+// 上行使用所选时区，下行保留倒计时/暂停/告警；用量条移到图标下方。
 @MainActor
 enum MenuBarCountdown {
-    private static let gap: CGFloat = 4      // 图标与倒计时之间的间距，对齐原先 SwiftUI 的排布
-    private static let inset: CGFloat = 1    // 文字左右各留 1pt，抗锯齿的边缘像素不会被裁掉
-    private static let barHeight: CGFloat = 2    // 用量条：菜单栏就这么点高，2pt 已经够看且不喧宾夺主
-    private static let barGap: CGFloat = 1.5     // 文字与用量条之间的留白
-    private static let barReference = "6m"       // 用量条固定长度＝这段文字在菜单栏字体下的宽度
-    // body 每 5 秒 tick 都会重算；键相同就复用同一个 NSImage，状态项不会因为换实例而重排宽度。
+    // 每 5 秒 tick 会重算；分钟、状态、用量和外观未改变时复用图片。
     private static var cache: (key: String, image: NSImage)?
 
-    static func label(icon: NSImage?, iconKey: String, title: String, percent: Double?,
+    static func label(icon: NSImage?, iconKey: String, title: String, clock: String, timeZoneLabel: String = "", percent: Double?,
                       fillOpacity: Double = 1, trackOpacity: Double = 0.22) -> NSImage? {
-        guard icon != nil || !title.isEmpty else { return nil }
-        // 颜色必须在 drawingHandler 之外按菜单栏外观解析好：handler 是延迟执行的，
-        // 里面的 NSColor.labelColor 会跟着“当时的绘制外观”走，浅色/深色切换时容易画反。
-        // 常量先取成局部量：drawingHandler 是 nonisolated 闭包，直接读 @MainActor 的静态属性
-        // 在 Swift 6 语言模式下会变成硬错误。
-        let (gap, inset, barHeight, barGap) = (Self.gap, Self.inset, Self.barHeight, Self.barGap)
+        let height: CGFloat = 22
+        let gap: CGFloat = 4
+        let inset: CGFloat = 1
+        let barHeight: CGFloat = 2
+        let barGap: CGFloat = 1.5
         let appearance = NSApp?.effectiveAppearance ?? .currentDrawing()
         let fillOpacity = Store.normalizedOpacity(fillOpacity, fallback: 1)
         let trackOpacity = Store.normalizedOpacity(trackOpacity, fallback: 0.22)
         let fraction = percent.map { min(1, max(0, $0 / 100)) }
-        // 键里把比例量化到 0.25%：文字没变、用量只抖动零点几个百分点时复用同一个 NSImage。
-        let key = "\(iconKey)|\(title)|\(fraction.map { Int(($0 * 400).rounded()) } ?? -1)|\(appearance.name.rawValue)|\(fillOpacity)|\(trackOpacity)"
+        let key = "\(iconKey)|\(title)|\(clock)|\(timeZoneLabel)|\(fraction.map { Int(($0 * 400).rounded()) } ?? -1)|\(appearance.name.rawValue)|\(fillOpacity)|\(trackOpacity)"
         if let cached = cache, cached.key == key { return cached.image }
 
-        let font = NSFont.menuBarFont(ofSize: 0)
+        // 在延迟绘制闭包之外解析外观颜色，避免深浅色切换后文字颜色错误。
         var baseColor = NSColor.labelColor
         var fillColor = UsageSeverity.of(percent).menuBarColor
         appearance.performAsCurrentDrawingAppearance {
             baseColor = NSColor.labelColor.usingColorSpace(.sRGB) ?? baseColor
             fillColor = fillColor.usingColorSpace(.sRGB) ?? fillColor
         }
-
         fillColor = fillColor.withAlphaComponent(fillOpacity)
-        let base = title.isEmpty ? nil : NSAttributedString(
-            string: title, attributes: [.font: font, .foregroundColor: baseColor])
         let trackColor = baseColor.withAlphaComponent(trackOpacity)
-        let textSize = base?.size() ?? .zero
-        let referenceSize = NSAttributedString(string: Self.barReference, attributes: [.font: font]).size()
-        let barWidth = ceil(referenceSize.width)
-        // 文字比用量条还窄时（"⏸"、"–"）按条宽留位，条不会被画布裁掉。
-        let textWidth = base == nil ? 0 : max(ceil(textSize.width), barWidth) + inset * 2
-        // 隐藏倒计时但有用量数据：条画在图标下方。整张图高度对齐有倒计时时的文字列，
-        // 图标太高（Codex 19.8pt）就等比缩到条上方剩下的空间里，状态项高度不跳。
-        let barUnderIcon = base == nil && icon != nil && fraction != nil
-        let iconBarColumnHeight = ceil(referenceSize.height) + barHeight + barGap
-        var iconSize = icon?.size ?? .zero
-        if barUnderIcon, iconSize.height > iconBarColumnHeight - barHeight - barGap {
-            let height = iconBarColumnHeight - barHeight - barGap
-            iconSize = NSSize(width: iconSize.width * height / iconSize.height, height: height)
-        }
-        // 文字这一列的高度要把底部用量条算进去，否则没有图标兜底时（图标资源缺失）文字会顶出画布。
-        let textColumnHeight = base == nil ? 0 : ceil(textSize.height) + barHeight + barGap
-        let size = NSSize(width: iconSize.width + (icon != nil && base != nil ? gap : 0) + textWidth,
-                          height: barUnderIcon ? iconBarColumnHeight : max(iconSize.height, textColumnHeight))
+        // 两行统一用 10pt 半粗体，增加小字号的清晰度；等宽数字避免时间变化时抖动。
+        let clockFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
+        let statusFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
+        let upper = NSAttributedString(string: clock,
+            attributes: [.font: clockFont, .foregroundColor: baseColor])
+        let lower = NSAttributedString(string: title,
+            attributes: [.font: statusFont, .foregroundColor: baseColor])
+        let reference = NSAttributedString(string: "00:00", attributes: [.font: clockFont]).size()
+        let upperSize = upper.size()
+        let lowerSize = lower.size()
+        let columnWidth = ceil(max(reference.width, upperSize.width, lowerSize.width))
 
+        // 即使没有用量数据也保留图标下方空间，数据恢复时位置不跳动。
+        var iconSize = icon?.size ?? .zero
+        let iconMaxHeight = height - barHeight - barGap
+        if iconSize.height > iconMaxHeight {
+            iconSize = NSSize(width: iconSize.width * iconMaxHeight / iconSize.height, height: iconMaxHeight)
+        }
+        let textX = iconSize.width + (icon == nil ? 0 : gap) + inset
+        let size = NSSize(width: textX + columnWidth + inset, height: height)
         let image = NSImage(size: size, flipped: false) { rect in
             func bar(_ x: CGFloat, _ width: CGFloat, _ color: NSColor) {
                 guard width > 0 else { return }
@@ -73,45 +58,47 @@ enum MenuBarCountdown {
                              xRadius: barHeight / 2, yRadius: barHeight / 2).fill()
             }
             if let icon {
-                // 图标下方有条时，图标在条上方剩下的空间里居中。
-                let reserved = barUnderIcon ? barHeight + barGap : 0
-                icon.draw(in: NSRect(x: 0, y: reserved + (rect.height - reserved - iconSize.height) / 2,
-                                     width: iconSize.width, height: iconSize.height))
+                icon.draw(in: NSRect(x: 0,
+                    y: barHeight + barGap + (iconMaxHeight - iconSize.height) / 2,
+                    width: iconSize.width, height: iconSize.height))
+                if let fraction {
+                    bar(0, iconSize.width, trackColor)
+                    bar(0, iconSize.width * fraction, fillColor)
+                }
             }
-            if barUnderIcon, let fraction {
-                bar(0, iconSize.width, trackColor)
-                bar(0, iconSize.width * fraction, fillColor)
-                return true
+            // 隐藏倒计时时时钟垂直居中；暂停和告警仍按原逻辑占据下行。
+            let upperCenter = title.isEmpty ? rect.height / 2 : rect.height * 0.75
+            upper.draw(at: NSPoint(x: textX + (columnWidth - upperSize.width) / 2,
+                                   y: upperCenter - upperSize.height / 2))
+            if !title.isEmpty {
+                lower.draw(at: NSPoint(x: textX + (columnWidth - lowerSize.width) / 2,
+                                       y: rect.height * 0.25 - lowerSize.height / 2))
             }
-            guard let base else { return true }
-            let originX = iconSize.width + (icon != nil ? gap : 0) + inset
-            // 文字与条各自在这一列里居中（列宽＝两者中较宽的那个），长文字下条居中、短文字下文字居中。
-            let column = max(textSize.width, barWidth)
-            let textX = originX + (column - textSize.width) / 2
-            let barX = originX + (column - barWidth) / 2
-            // 文字整体上抬，给底部那条用量条腾出位置；抬完仍在剩余空间里居中，不会贴着上沿。
-            let originY = barHeight + barGap + (rect.height - barHeight - barGap - textSize.height) / 2
-            base.draw(at: NSPoint(x: textX, y: originY))
-            guard let fraction else { return true }   // 没有用量数据就不画线，位置不变，文字不跳
-            bar(barX, barWidth, trackColor)                      // 底槽：0%…100% 的整段
-            bar(barX, barWidth * fraction, fillColor)            // 已用：从左往右填到 fraction
+            // 图标资源缺失时，在文字列左侧保留一条窄用量指示，避免信息丢失。
+            if icon == nil, let fraction {
+                trackColor.setFill()
+                NSRect(x: 0, y: 0, width: 1, height: rect.height).fill()
+                fillColor.setFill()
+                NSRect(x: 0, y: 0, width: 1, height: rect.height * fraction).fill()
+            }
             return true
         }
-        image.isTemplate = false   // 自带颜色，别让系统按模板染成单色
-        image.accessibilityDescription = percent.map { "\(title.isEmpty ? "KeepAliveBar" : title)，已用 \(Int($0.rounded()))%" }
-            ?? (title.isEmpty ? "KeepAliveBar" : title)
+        image.isTemplate = false
+        let description = "\(timeZoneLabel) \(clock)" + (title.isEmpty ? "" : "，\(title)")
+        image.accessibilityDescription = percent.map { description + "，已用 \(Int($0.rounded()))%" } ?? description
         cache = (key, image)
         return image
     }
 }
 
 extension Store {
-    // 菜单栏标签图（图标 + 倒计时）。图标资源缺失且隐藏了倒计时时返回 nil，调用方兜个占位符。
+    // 时钟始终显示；倒计时隐藏或暂停不影响时钟。
     var menuBarImage: NSImage? {
         let codex = displayedCodexFirst
         return MenuBarCountdown.label(icon: codex ? MenuBarArtwork.codex : MenuBarArtwork.clawd,
                                       iconKey: codex ? "codex" : "clawd",
-                                      title: menuTitle, percent: menuUsagePercent,
+                                      title: menuTitle, clock: localHM(now),
+                                      timeZoneLabel: DisplayTimeZone.label(timeZoneSelection), percent: menuUsagePercent,
                                       fillOpacity: menuBarFillOpacity, trackOpacity: menuBarTrackOpacity)
     }
 }

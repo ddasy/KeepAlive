@@ -32,9 +32,30 @@ enum UsageSeverity {
 }
 
 func sevColor(_ pct: Double?) -> Color { UsageSeverity.of(pct).color }
-func localHM(_ d: Date) -> String { let f = DateFormatter(); f.dateFormat = "HH:mm"; return f.string(from: d) }
-func localMDHM(_ d: Date) -> String { let f = DateFormatter(); f.dateFormat = "MM-dd HH:mm"; return f.string(from: d) }
-func localMonthDayHM(_ d: Date) -> String { let f = DateFormatter(); f.dateFormat = "M月d日 HH:mm"; return f.string(from: d) }
+// 所有界面时刻都从 Store 获取时区；不改变底层 Date 或调度时长。
+extension Store {
+    var displayTimeZone: TimeZone { DisplayTimeZone.resolve(timeZoneSelection) }
+
+    func formattedTime(_ date: Date, format: String) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = displayTimeZone
+        formatter.dateFormat = format
+        return formatter.string(from: date)
+    }
+
+    func localHM(_ date: Date) -> String { formattedTime(date, format: "HH:mm") }
+    func localMDHM(_ date: Date) -> String { formattedTime(date, format: "MM-dd HH:mm") }
+    func localMonthDayHM(_ date: Date) -> String { formattedTime(date, format: "M月d日 HH:mm") }
+
+    // 成功记录保存 Date，切换时区时即时重绘，不能缓存带旧时区的时间字符串。
+    func fireResultText(codex: Bool) -> String {
+        let text = codex ? codexLastFireResult : lastFireResult
+        let reset = codex ? codexLastFireResultReset : lastFireResultReset
+        return reset.map { text + "：新窗口 \(fmt($0)) 重置" } ?? text
+    }
+}
 // 用量条。刻意不用 ProgressView：它在 macOS 上是 NSProgressIndicator 包出来的 AppKit 控件，
 // 颜色跟着**窗口的 key/active 状态**走——悬停快照那个面板故意不抢焦点、永远不是 key 窗口，
 // 于是 .tint 会被系统灰掉，和点开的弹窗对不上。纯 SwiftUI 图形没有这个包袱，两处渲染完全一致。
@@ -53,17 +74,20 @@ struct UsageBar: View {
     }
 }
 
-func resetInfo(_ reset: Date?, _ now: Date) -> String {
-    guard let r = reset else { return "重置 —" }
-    let rem = r.timeIntervalSince(now)
-    return rem >= 0 ? "重置 \(localHM(r))（剩余时间 \(Store.dhm(rem))）"
-                    : "重置 \(localHM(r))（已过 \(Store.dhm(-rem))）"
-}
+extension Store {
+    func resetInfo(_ reset: Date?, _ now: Date) -> String {
+        guard let r = reset else { return "重置 —" }
+        let rem = r.timeIntervalSince(now)
+        return rem >= 0 ? "重置 \(localHM(r))（剩余时间 \(Store.dhm(rem))）"
+                        : "重置 \(localHM(r))（已过 \(Store.dhm(-rem))）"
+    }
 
-// 周限专用：重置往往在好几天后，只给 HH:mm 根本看不出是哪天 → 带上月日，例：重置8月5日 13:22（剩余3d 9h 42m）
-func weeklyResetInfo(_ reset: Date?, _ now: Date) -> String {
-    guard let r = reset else { return "重置 —" }
-    let rem = r.timeIntervalSince(now)
-    return rem >= 0 ? "重置\(localMonthDayHM(r))（剩余\(Store.dhm(rem))）"
-                    : "重置\(localMonthDayHM(r))（已过\(Store.dhm(-rem))）"
+    // 周限专用：重置往往在好几天后，只给 HH:mm 根本看不出是哪天 → 带上月日，例：重置8月5日 13:22（剩余3d 9h 42m）
+    func weeklyResetInfo(_ reset: Date?, _ now: Date) -> String {
+        guard let r = reset else { return "重置 —" }
+        let rem = r.timeIntervalSince(now)
+        return rem >= 0 ? "重置\(localMonthDayHM(r))（剩余\(Store.dhm(rem))）"
+                        : "重置\(localMonthDayHM(r))（已过\(Store.dhm(-rem))）"
+    }
+
 }

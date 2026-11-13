@@ -247,6 +247,17 @@ struct AppSettingsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
+            Text("时间显示").font(.headline)
+            Picker("时区", selection: $s.timeZoneSelection) {
+                Text("跟随系统").tag(DisplayTimeZone.system)
+                ForEach(DisplayTimeZone.offsets, id: \.self) { minutes in
+                    Text(DisplayTimeZone.label(String(minutes))).tag(String(minutes))
+                }
+            }
+            .pickerStyle(.menu)
+            Text("菜单栏、重置、刷新与保活记录统一使用此时区。固定 UTC 偏移不随夏令时变化。")
+                .font(.caption).foregroundStyle(.secondary)
+            Divider()
             if !s.menuControls(hidden: true).isEmpty {
                 Text("已隐藏的控件").font(.headline)
                 FeatureControls(hidden: true)
@@ -327,9 +338,9 @@ struct KeepaliveActivitySection: View {
             ForEach(s.displayedCodexFirst ? [true, false] : [false, true], id: \.self) { codex in
                 let title = codex ? "Codex" : "Claude"
                 let lastFire = codex ? s.codexLastFire : s.lastFire
-                let result = codex ? s.codexLastFireResult : s.lastFireResult
+                let result = s.fireResultText(codex: codex)
                 if let lastFire {
-                    Text("上次 \(title) 保活：\(localMDHM(lastFire))")
+                    Text("上次 \(title) 保活：\(s.localMDHM(lastFire))")
                         .font(.caption2).foregroundStyle(.secondary)
                 }
                 if !result.isEmpty {

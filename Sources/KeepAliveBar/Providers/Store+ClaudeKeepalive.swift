@@ -85,7 +85,8 @@ extension Store {
         lastFire = stamp
         preferences.set(stamp.timeIntervalSince1970, forKey: "lastFire")
         lastFireFailed = false
-        lastFireResult = "Claude 保活成功（直连，~8 tokens）：新窗口 \(fmt(end)) 重置"
+        lastFireResult = "Claude 保活成功（直连，~8 tokens）"
+        lastFireResultReset = end
         log("FIRED direct -> 新窗口 windowEnd=\(fmt(end))")
         return true
     }

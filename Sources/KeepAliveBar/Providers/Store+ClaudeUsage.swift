@@ -110,7 +110,8 @@ extension Store {
                 // 旧的“无可用 token”会一直挂着。服务端已确认有活动窗口 → 保活目标已达成，清掉陈旧失败。
                 if hasActiveWindow, lastFireFailed, !busyFiring {
                     lastFireFailed = false
-                    lastFireResult = "Claude 窗口已激活：\(fmt(windowEnd)) 重置"
+                    lastFireResult = "Claude 窗口已激活"
+                    lastFireResultReset = windowEnd
                     log("FIRE 失败状态已清除：服务端已有活动窗口 → \(fmt(windowEnd))")
                 }
                 // 关键诊断日志：原始 resets_at / 用量 / is_active 全记下——下次窗口过期时这行会揭示接口的真实返回

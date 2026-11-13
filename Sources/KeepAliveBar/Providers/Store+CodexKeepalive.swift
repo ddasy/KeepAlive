@@ -128,7 +128,8 @@ extension Store {
         codexLastFire = stamp
         preferences.set(stamp.timeIntervalSince1970, forKey: "codexLastFire")
         codexLastFireFailed = false
-        codexLastFireResult = "Codex 激活成功（直连，~30 tokens）：新窗口 \(fmt(reset)) 重置"
+        codexLastFireResult = "Codex 激活成功（直连，~30 tokens）"
+        codexLastFireResultReset = reset
         log("CODEX FIRED direct -> 新窗口 reset=\(fmt(reset))")
         return true
     }

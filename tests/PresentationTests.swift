@@ -3,14 +3,21 @@ import AppKit
 
 extension TestSuite {
     func testPresentation() {
-        let image = MenuBarCountdown.label(icon: nil, iconKey: "test", title: "2h00m", percent: 50)!
-        let same = MenuBarCountdown.label(icon: nil, iconKey: "test", title: "2h00m", percent: 50)!
+        let image = MenuBarCountdown.label(icon: nil, iconKey: "test", title: "2h00m", clock: "14:08", percent: 50)!
+        let same = MenuBarCountdown.label(icon: nil, iconKey: "test", title: "2h00m", clock: "14:08", percent: 50)!
         check(image === same, "unchanged menu label reuses cache")
-        let faded = MenuBarCountdown.label(icon: nil, iconKey: "test", title: "2h00m", percent: 50, fillOpacity: 0.4)!
+        let faded = MenuBarCountdown.label(icon: nil, iconKey: "test", title: "2h00m", clock: "14:08", percent: 50, fillOpacity: 0.4)!
         check(image !== faded && image.size == faded.size, "fill depth invalidates cache without changing layout")
-        let track = MenuBarCountdown.label(icon: nil, iconKey: "test", title: "2h00m", percent: 50, fillOpacity: 0.4, trackOpacity: 0.6)!
+        let track = MenuBarCountdown.label(icon: nil, iconKey: "test", title: "2h00m", clock: "14:08", percent: 50, fillOpacity: 0.4, trackOpacity: 0.6)!
         check(faded !== track, "track depth independently invalidates cache")
         check(track.tiffRepresentation != nil, "configured menu label renders successfully")
+        let nextMinute = MenuBarCountdown.label(icon: nil, iconKey: "test", title: "2h00m", clock: "14:09", percent: 50)!
+        check(nextMinute !== image && nextMinute.size == image.size, "clock minute changes invalidate cache without width jitter")
+        for title in ["", "⏸", "⚠︎", "⚠︎ ↔ 5h59m", "now", "–"] {
+            let label = MenuBarCountdown.label(icon: MenuBarArtwork.codex, iconKey: "codex", title: title, clock: "00:00", timeZoneLabel: "UTC+8", percent: 50)!
+            check(label.size.height == 22 && label.tiffRepresentation != nil, "compact label renders state \(title)")
+            check(label.accessibilityDescription?.contains("UTC+8 00:00") == true, "clock remains accessible in state \(title)")
+        }
         let s = Store(preferences: defaults, monitoring: false)
         let soon = base.addingTimeInterval(3600)
         let later = base.addingTimeInterval(7200)
