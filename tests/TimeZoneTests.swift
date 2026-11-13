@@ -49,5 +49,22 @@ extension TestSuite {
         s.codexLastFireResult = "失败"
         check(s.lastFireResultReset == nil && s.codexLastFireResultReset == nil, "new results clear previous success deadlines")
         check(s.fireResultText(codex: false) == "失败", "errors do not inherit a stale reset timestamp")
+        for seconds in [0.0, 0.001, 5, 46, 59, 59.999] {
+            check(Store.nextClockMinute(after: date.addingTimeInterval(seconds)) == date.addingTimeInterval(60),
+                  "next clock refresh aligns to minute boundary from second \(seconds)")
+        }
+        check(Store.nextClockMinute(after: date.addingTimeInterval(-0.001)) == date,
+              "clock refresh handles midnight boundary")
+        s.timeZoneSelection = "480"
+        s.paused = true
+        s.refreshMenuClock(at: date)
+        check(s.clockNow == date && s.now == date.addingTimeInterval(-3600),
+              "clock refresh is independent of keepalive snapshot and pause state")
+        check(s.menuBarImage?.accessibilityDescription?.contains("UTC+8 00:00") == true,
+              "menu clock uses minute snapshot rather than keepalive tick")
+        s.refreshMenuClock(at: date.addingTimeInterval(185))
+        check(s.localHM(s.clockNow) == "00:03", "delayed clock refresh catches up directly without replaying minutes")
+        check(s.clockTimer == nil && s.clockSubscriptions.isEmpty,
+              "isolated tests do not register live timers or notification observers")
     }
 }

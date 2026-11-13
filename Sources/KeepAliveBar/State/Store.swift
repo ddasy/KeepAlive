@@ -67,6 +67,7 @@ final class Store: ObservableObject {
     @Published var lastFireResultReset: Date?
     @Published var busyFiring = false
     @Published var now: Date = Date()
+    @Published var clockNow: Date = Date() // 菜单栏时钟独立按整分钟更新，不使用保活 tick 的快照。
     // 保活开关拆成两路：Claude / Codex 各自独立，互不影响（旧版单一 autoEnabled 键在 init 里迁移）
     @Published var claudeAutoEnabled: Bool {
         didSet { preferences.set(claudeAutoEnabled, forKey: "claudeAutoEnabled") }
@@ -91,7 +92,10 @@ final class Store: ObservableObject {
         didSet { preferences.set(autoQueryOnOpen, forKey: "autoQueryOnOpen") }
     }
     @Published var timeZoneSelection: String {
-        didSet { preferences.set(DisplayTimeZone.normalized(timeZoneSelection), forKey: "displayTimeZone") }
+        didSet {
+            preferences.set(DisplayTimeZone.normalized(timeZoneSelection), forKey: "displayTimeZone")
+            refreshMenuClock()
+        }
     }
     @Published var hideCountdown: Bool {                          // 隐藏下行倒计时，时钟仍显示
         didSet { preferences.set(hideCountdown, forKey: "hideCountdown") }
@@ -192,6 +196,8 @@ final class Store: ObservableObject {
     }
 
     private var tickTimer: Timer?
+    var clockTimer: Timer?
+    var clockSubscriptions = Set<AnyCancellable>()
     var acting = false   // 正在处理“窗口关闭”（联网确认+续窗），防重入
 
     var home: String { NSHomeDirectory() }
@@ -268,6 +274,7 @@ final class Store: ObservableObject {
         tickTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
         }
+        startMenuClock()
         warmupIfNeeded()
     }
 

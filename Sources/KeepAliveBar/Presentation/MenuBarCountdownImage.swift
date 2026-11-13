@@ -97,7 +97,7 @@ extension Store {
         let codex = displayedCodexFirst
         return MenuBarCountdown.label(icon: codex ? MenuBarArtwork.codex : MenuBarArtwork.clawd,
                                       iconKey: codex ? "codex" : "clawd",
-                                      title: menuTitle, clock: localHM(now),
+                                      title: menuTitle, clock: localHM(clockNow),
                                       timeZoneLabel: DisplayTimeZone.label(timeZoneSelection), percent: menuUsagePercent,
                                       fillOpacity: menuBarFillOpacity, trackOpacity: menuBarTrackOpacity)
     }
